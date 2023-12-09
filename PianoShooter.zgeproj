@@ -1,0 +1,1408 @@
+<?xml version="1.0" encoding="iso-8859-1" ?>
+<ZApplication Name="App" Caption="ZGameEditor application" AmbientLightColor="0.502 0.502 0.502 1" CustomScreenWidth="1" CameraPosition="-3.2 16.8 161.8" ClipNear="0.01" ClipFar="1000" FileVersion="2">
+  <OnLoaded>
+    <ZExternalLibrary ModuleName="ZGameEditor Visualizer">
+      <Source>
+<![CDATA[// ZGameEditor Visualizer built-in functions
+void ParamsReadValueForLayer(xptr Handle, int Layer, int Param, ref float Value) {}
+void ParamsWriteValueForLayer(xptr Handle, int Layer, int Param, float NewValue) {}
+void ParamsChangeName(xptr Handle,int Layer, int Param, string NewName) {}
+// Don't see docs for this one, but it does appear to give you a name
+// for the specified layer (0-based -> 'A' = 0). Used by PianoLink feature.
+string ZgeVizGetEffectName(xptr Handle, int LayerNr) {}]]>
+      </Source>
+    </ZExternalLibrary>
+    <ZLibrary Name="PianoLib" Comment="Piano related functions">
+      <Source>
+<![CDATA[// Long term, this should become a real float printer?
+// Ryu's method is a lot of code though.
+string impFloatToStr(float fval)
+{
+   string theString;
+   // yeah, fix this.
+   theString = "(" + intToStr(fVal*1000) + "/1000)";
+   return theString;
+}
+
+// Dump all parameters to trace.
+void DumpParameters()
+{
+   for (int i = 0; i < Parameters.SizeDim1; i++)
+   {
+     float pval = Parameters[i];
+     trace("Parameter " + intToStr(i) + " = " + impFloatToStr(pval));
+   }
+}
+
+vec3 getColor(int channel, int noteIndex)
+{
+  vec3 curColor;
+  int colorSet = round(Parameters[P_COLOR_PALETTE] * 1000);
+
+  if (Parameters[P_COLOR_CHANNEL] > 0.5)
+  {
+    curColor[0] = ChannelColors[colorSet,channel,0];
+    curColor[1] = ChannelColors[colorSet,channel,1];
+    curColor[2] = ChannelColors[colorSet,channel,2];
+  }
+  else
+  {
+    int index = floor(noteIndex / 8.5);
+    float distance = (noteIndex - floor(noteIndex/8.5)*8.5)/16.0;
+
+    vec3 color1;
+    vec3 color2;
+    color1[0] = ChannelColors[colorSet,index,0];
+    color1[1] = ChannelColors[colorSet,index,1];
+    color1[2] = ChannelColors[colorSet,index,2];
+    color2[0] = ChannelColors[colorSet,index+1,0];
+    color2[1] = ChannelColors[colorSet,index+1,1];
+    color2[2] = ChannelColors[colorSet,index+1,2];
+
+    curColor[0] = color1[0]*(1.0 - distance) + color2[0]*distance;
+    curColor[1] = color1[1]*(1.0 - distance) + color2[1]*distance;
+    curColor[2] = color1[2]*(1.0 - distance) + color2[2]*distance;
+
+
+  }
+
+
+  return curColor;
+}
+// TODO - fix this.
+// Really awful tap tempo - can we just query it?
+// Ok - now we take a combo box so you can at least
+// make it solid on tempos that match multiples of 10....
+void FindTempo()
+{
+  int tempoType = floor(PARAMETERS[P_TEMPO]*1000);
+
+  // Auto tempo.....
+  if (tempoType == 0)
+  {
+    // The higher, the more accurate, but the longer it takes
+    // for it to get or adjust a tempo.
+    int numBeatsToAvg = 60;
+
+    if (LastBeat > SongPositionInBeats)
+    {
+      LastBeatTime = App.Time;
+      LastBeat = SongPositionInBeats;
+      BeatCounter = 1;
+    }
+    else
+    {
+      BeatCounter = (BeatCounter +1 )% numBeatsToAvg;
+      if (BeatCounter == 0)
+      {
+        if (LastBeatTime != 0)
+        {
+          float diff = (SongPositionInBeats - LastBeat)/(App.Time - LastBeatTime);
+          float newTempo = diff * 60;
+          if (Tempo == 0)
+          {
+            trace("Got initial tempo! It's " + IntToStr(newTempo));
+          }
+          Tempo = newTempo;
+        }
+        LastBeatTime = App.Time;
+        LastBeat = SongPositionInBeats;
+      }
+    }
+  }
+  else
+  {
+    // List starts at 60 right now after auto, and goes up by 10 each time.
+    Tempo = (tempoType - 1)* 10 + 60;
+    // Fine adjust allows you to add 0-9 to the base
+    int tempoFine = floor(PARAMETERS[P_TEMPO_FINE]*10);
+    Tempo += tempoFine;
+  }
+}
+
+// Kills all note models on their next update.
+void clearNotes()
+{
+  trace("Clear Notes");
+  for (int c = 0; c < 16; c++)
+  {
+     for (int n = 0; n < 128; n++)
+     {
+       if (ActiveNotes[n,c] != null)
+       {
+        ActiveNotes[n,c].noteIsActive = 0;
+        ActiveNotes[n,c] = null;
+       }
+     }
+  }
+  ClearAllNotes = 1;
+}
+
+void clearKeys()
+{
+  trace("Clear Keys");
+  for (int i = 0; i < 128; ++i)
+  {
+    KeyArray[i].isDown = 0;
+  }
+}
+
+// Called when playing has started in FL Studio
+void onPlayingStart()
+{
+  TotalNotes = 0;
+  FinalNotes = 0;
+  TotalNoteEnds = 0;
+  isPlaying = 1;
+}
+
+// Called when playing ends
+void onPlayingEnd()
+{
+  FinalNotes = TotalNotes;
+  trace("Final notes: " + intToStr(FinalNotes) + " Unfinished Notes: " + IntToStr(TotalNotes - TotalNoteEnds));
+  isPlaying = 0;
+  clearNotes();
+  clearKeys();
+  //DumpParameters();
+}
+
+// Deactive note model when MIDI Note ends
+void endNote(int c, int n, int key)
+{
+  if (ActiveNotes[n,c] != null)
+  {
+    ActiveNotes[n,c].noteIsActive = 0;
+    ActiveNotes[n,c].totalDelta += app.DeltaTime;
+  }
+  ActiveNotes[n,c] = null;
+}
+
+
+// Create node model on MIDI start note
+void createNote(int c, int n,float v, int key)
+{
+  if (ActiveNotes[n,c] != null)
+  {
+    endNote(c,n,key);
+  }
+
+  ActiveNotes[n,c] = createModel(NoteModel);
+  if (Parameters[P_USE_VELOCITY] > 0.5)
+  {
+    ActiveNotes[n,c].vel = v/127.0;
+  }
+  else
+  {
+    ActiveNotes[n,c].vel = 1.0;
+  }
+  ActiveNotes[n,c].startTime = app.DeltaTime;
+  ActiveNotes[n,c].noteIndex = n;
+  ActiveNotes[n,c].noteIsActive = 1;
+  ActiveNotes[n,c].noteChannel = c;
+  ActiveNotes[n,c].Position.Y = NoteStart;
+  ActiveNotes[n,c].Position.X = KeyArray[key].Position.X;
+  ActiveNotes[n,c].Position.Z = KeyArray[key].Position.Z;
+}
+
+// Pick the piano key for a note, or -1 if out of range.
+int keyFromNote(int note)
+{
+  int key = (note - FirstPianoKey);
+  if (key < 0)
+  {
+     key = -1;
+  }
+  if (key >= NumPianoKeys)
+  {
+    key = -1;
+  }
+
+  // If the key is out of range, we can either ignore it
+  // or transpose to fit our keyboard....
+  if (key < 0)
+  {
+    // *which* key to use on transpose is a question
+    // that needs more thought.
+    if (Parameters[P_TRANSPOSE] > 0.5)
+    {
+      int noteLetter = note % 12;
+      int start = FirstPianoKey % 12;
+      int end = (FirstPianoKey + NumPianoKeys) % 12;
+
+      key = (noteLetter + 12 - start) % 12;
+      // Still can't do it?
+      if (key >= NumPianoKeys)
+      {
+         key = -1;
+      }
+    }
+  }
+
+  return key;
+}
+
+// Called when a MIDI note starts
+void onNoteOn(int channel, int note, int velocity)
+{
+  TotalNotes++;
+ //  trace("Note on " +intToStr(channel) + ":" + intToStr(note) + " @ " + intToStr(velocity));
+  NoteState[note,channel] = velocity;
+
+  int key = keyFromNote(note);
+  if (key >= 0)
+  {
+    if (PianoMode == 0)
+    {
+      KeyArray[key].isDown = 1;
+      KeyArray[key].lastChannel = channel;
+
+      KeyArray[key].Position.Y = KeyPositions[key,1] - 1;
+    }
+    createNote(channel,note,velocity, key);
+  }
+}
+
+// Called when a MIDI note stops
+void onNoteOff(int channel, int note, int velocity)
+{
+  TotalNoteEnds++;
+//  trace("Note off " + intToStr(channel) + ":" + intToStr(note));
+  NoteState[note,channel] = 0;
+  int key = keyFromNote(note);
+  if (key >= 0)
+  {
+    if (PianoMode == 0)
+    {
+      KeyArray[key].isDown = 0;
+    }
+    endNote(channel,note, key);
+  }
+}
+
+// Update first/num keys and arg, returns > 0 if any changed.
+int updateKeys()
+{
+  int changed = 0;
+  int newNum  = floor(Parameters[P_NUM_KEYS]*116 + 12);
+  int newFirst = floor(Parameters[P_FIRST_KEY]*116);
+  float newArc = Parameters[P_ARC];
+
+  if (newFirst + newNum >= 128)
+  {
+    newFirst = 128 - newNum;
+  }
+
+  if ((newNum != NumPianoKeys) ||
+      (newFirst != FirstPianoKey) ||
+      (newArc != PianoArc))
+  {
+    NumPianoKeys = newNum;
+    FirstPianoKey = newFirst;
+    PianoArc = newArc;
+    changed = 1;
+  }
+  return changed;
+}
+
+// Set up the keyboard for number of keys and first key and current arc
+void GenKeyboard(int firstKey, int numKeys, float arc)
+{
+
+
+  // Calc start of keyboard on X
+  float arcKeySpacing = KeySpacing*.75;
+  KeyStart = -(arcKeySpacing*numKeys*.5);
+  int endPianoKey = firstKey + numKeys;
+
+  for (int i = 0; i < 128; i++)
+  {
+      KeyArray[i].visible = 0;
+      if (i >= endPianoKey)
+      {
+        KeyArray[i].isDown = 0;
+      }
+  }
+  // Generate the piano keyboard
+  for (int i = firstKey; i < endPianoKey; i++)
+  {
+    int key = i - firstKey;
+
+    float flatPos = (i - 64.0) / 128.0;
+    float arcPos  = PI - (PI * i/128.0);
+
+    float flatLayoutX = flatPos * KeySpacing * 128;
+    float flatLayoutZ = 0;
+
+    float arcLayoutX =   arcKeySpacing  * 64 * cos(arcPos);
+    float arcLayoutZ =  -arcKeySpacing  * 64 * sin(arcPos);
+
+
+    // KeyPositions holds the "Base" key positions with arc.
+    // KeyArray objects have the actual current position, which may be
+    // modified by a press.
+
+    // So this averaging mostly works, but the key spacing isn't great inbetween states.
+    // TODO: Fix it.
+    KeyPositions[key,0] = arcLayoutX*arc + ((1.0 - arc)* flatLayoutX );
+    KeyPositions[key,1] = 0;
+    KeyPositions[key,2] = arcLayoutZ*arc + ((1.0 - arc) * flatLayoutZ );
+
+    KeyArray[key].visible = 1;
+    KeyArray[key].NoteValue = i;
+
+    // Set Key objects to their new default position
+    KeyArray[key].Position.X = KeyPositions[key,0];
+    KeyArray[key].Position.Y = KeyPositions[key,1];
+    KeyArray[key].Position.Z = KeyPositions[key,2];
+
+    KeyArray[key].Rotation.Y = -.5*((i - 64.0)/128.0) * arc;
+  }
+}
+
+
+
+//---------------------------------------------------------------------------
+//
+// FL Studio message entry points.
+//
+//---------------------------------------------------------------------------
+void OnHostMessage(int id, int index, int value)
+{
+  switch (id)
+  {
+  case 12:
+    if (value > 0)
+      onPlayingStart();
+    else
+      onPlayingEnd();
+    break;
+  default:
+    trace("Host: " + intToStr(id)
+                + ":" + intToStr(index)
+                + ":" + intToStr(value));
+  }
+}
+
+void OnMidiMessage(int status, int data1, int data2)
+{
+  //trace("Got midi " + intToStr(status)
+  //               + ":" + intToStr(data1)
+  //               + ":" + intToStr(data2));
+  int channel = status & 0x0f;
+  int opcode = status & 0xf0;
+
+  switch (opcode)
+  {
+    case 0x80:
+      onNoteOff(channel, data1,data2);
+      break;
+    case 0x90:
+      onNoteOn(channel, data1,data2);
+      break;
+    case 0xa0: // polyphonic aftertouch
+      //trace("PAT ch " + intToStr(channel));
+      break;
+    case 0xb0: // control change
+      //trace("CC ch " + intToStr(channel));
+      break;
+    case 0xc0: // program change
+      //trace("PC ch " + intToStr(channel));
+      break;
+    case 0xd0: // aftertouch
+      //trace("AT ch " + intToStr(channel));
+      break;
+    case 0xe0: // Pitch wheel
+      //trace("PW ch " + intToStr(channel));
+      break;
+    case 0xf0: // system messages
+      //trace("SYS");
+      break;
+    default: // ?
+      trace("UNKNOWN MIDI: " + IntToStr(status) + "," + IntToStr(data1) + "," + IntToStr(data2));
+      break;
+  }
+}
+
+// Give a knob an exponential feel.
+// Large powers weight to large values.
+float expKnobFunc(float x, float power)
+{
+  return (1.0 - (1.0 - pow(x,power)));
+}
+
+// Returns 1 if it's a flat/sharp black key,
+//         0 if it's a natural white key.
+int isNoteBlack(int theNote)
+{
+  int isItBlack = 1;
+  switch(theNote % 12)
+  {
+    case 0: //c
+    case 2: //d
+    case 4: //e
+    case 5: //f
+    case 7: //g
+    case 9: //a
+    case 11: //b
+      isItBlack = 0;
+      break;
+  }
+
+  return isItBlack;
+}]]>
+      </Source>
+    </ZLibrary>
+    <ZLibrary Name="PianoLinkLib" HasInitializer="1">
+      <Source>
+<![CDATA[// If we just blindly write every cycle, it can cause a crash at the end
+// of rendering the real video.  So we have to buffer parameters
+// and only write them when they are individually changed.
+float[P_NUM_PARAMS] ParamBuffer;
+int ParamsInitialized = 0;
+// Plugin and layer for linking to other visualizer layers.
+xptr FLPluginHandle;
+int LayerNr;]]>
+      </Source>
+    </ZLibrary>
+    <ZExpression Name="InitializeKeys">
+      <Expression>
+<![CDATA[// Save Viewport
+ViewPortSize=vector2(app.ViewportWidth,app.ViewportHeight);
+
+// Fill the note array with null
+for (int i = 0; i < 128; i++)
+{
+  for (int j = 0; j < 16; j++)
+  {
+    ActiveNotes[i,j] = null;
+  }
+  KeyArray[i] = createModel(PianoKeyModel);
+  KeyArray[i].visible = 0;
+
+  KeyArray[i].pressStep[0] = 0.3;
+  KeyArray[i].pressStep[1] = 0.3;
+  KeyArray[i].pressStep[2] = 0.3;
+}
+
+updateKeys();
+GenKeyboard(FirstPianoKey,NumPianoKeys,PianoArc);]]>
+      </Expression>
+    </ZExpression>
+  </OnLoaded>
+  <OnUpdate>
+    <ZExpression Name="PianoLink">
+      <Expression>
+<![CDATA[// This allows you to link all PianoShooters such that one controls
+// the critical parameters of the other to keep them in sync.
+//
+// Mostly meant for 2 pianos, where one is the piano and the other is the notes
+// with buffering and effects separated between them.  With more than two,
+// this system probably breaks down but might be useful for initial config.
+
+// Means you only have to automate the one you check
+if (Parameters[P_PIANOLINK] > 0.5)
+{
+  string test = "Looking for pianoshooters...";
+  for (int curLayer = 0; curLayer < 100; curLayer++)
+  {
+    // SKip if it's us :)
+    if (curLayer == LayerNr)
+      continue;
+
+    test = ZgeVizGetEffectName(FLPluginHandle,curLayer);
+    if (test == "PianoShooter")
+    {
+
+      for (int i = 0; i < Parameters.SizeDim1; i++)
+      {
+        if ((ParamsInitialized == 0) || (Parameters[i] != ParamBuffer[i]))
+        {
+          switch (i)
+          {
+            // These should make sense if different / random.
+            // With only two, might invert some of them?
+            case P_SHOW_PIANO:
+            case P_SHOW_NOTES:
+            case P_SHOW_PARTICLES:
+            case P_LIGHT_KEYS:
+              break;
+
+            // These should be linked
+            case P_USE_VELOCITY:
+            case P_NOTE_TYPE:
+            case P_COLOR_PALETTE:
+            case P_COLOR_CHANNEL:
+            case P_NOTE_DIR:
+            case P_TRANSPOSE:
+            case P_PIANO_MODE:
+            case P_PREROLL:
+            case P_COLOR_PALETTE:
+            case P_TEMPO:
+            case P_TEMPO_FINE:
+            case P_NOTE_SPEED:
+            case P_KEYBOARD_ANGLE:
+            case P_CAMERA_X:
+            case P_CAMERA_Y:
+            case P_CAMERA_Z:
+            case P_CAMERA_YAW:
+            case P_CAMERA_PITCH:
+            case P_ARC:
+            case P_NUM_KEYS:
+            case P_FIRST_KEY:
+              ParamsWriteValueForLayer(FLPluginHandle,curLayer,i, Parameters[i]);
+              break;
+
+            // This one.... maybe just make sure only one is set?
+            case P_PIANOLINK:
+              ParamsWriteValueForLayer(FLPluginHandle,curLayer,i, 0);
+              break;
+          }
+          ParamBuffer[i] = Parameters[i];
+        } // End if parameters uninitialized or changed.
+      } // End for each parameter
+    } // End if it's a pianoshooter layer
+  } // End for each layer
+  ParamsInitialized = 1;
+} // END IF PIANOLINK]]>
+      </Expression>
+    </ZExpression>
+    <ZExpression Name="PianoShooterLogic">
+      <Expression>
+<![CDATA[if (LastTime != 0)
+{
+  CurDelta = App.Time - LastTime;
+}
+LastTime = App.Time;
+
+// Update camera starting position from sliders
+App.CameraPosition.X = (Parameters[P_CAMERA_X]* 200) - 100;
+App.CameraPosition.Y = (Parameters[P_CAMERA_Y]* 200) - 100;
+App.CameraPosition.Z = 5 + (Parameters[P_CAMERA_Z]) * 200;
+
+
+vec3 cameraPos = App.CameraPosition;
+App.CameraRotation.X = 0;
+App.CameraRotation.Y = 0;
+App.CameraRotation.Z = 0;
+
+// Apply Pitch first - we want to keep looking at the keyboard,
+// so when we change the camera pitch, we change the camera location too.
+cameraPos = App.CameraPosition;
+vec3 cameraRot = App.CameraRotation;
+float pitch = Parameters[P_CAMERA_PITCH]/4.0;
+float pitchPi = -2*pitch*(PI);
+
+App.CameraPosition.X = cameraPos[0];
+App.CameraPosition.Y = cameraPos[1]*cos(pitchPi)-cameraPos[2]*sin(pitchPi);
+App.CameraPosition.Z = cameraPos[1]*sin(pitchPi) + cameraPos[2]*cos(pitchPi);
+
+App.CameraRotation.X = pitch;
+
+// Now apply Yaw similarly
+cameraPos = App.CameraPosition;
+float yaw = Parameters[P_CAMERA_YAW];
+float yawPi = -yaw*2*PI;
+
+App.CameraPosition.X = cameraPos[0] * cos(yawPi) + cameraPos[2]*sin(yawPi);
+App.CameraPosition.Y = cameraPos[1];
+App.CameraPosition.Z = -cameraPos[0]*sin(yawPi) + cameraPos[2]*cos(yawPi);
+App.CameraRotation.Y = yaw;
+
+
+// If we set clear on a previous cycle, reset it now.
+if (ClearAllNotes > 0)
+{
+  ClearAllNotes = 0;
+}
+
+// Get preroll
+int preBeats = floor(Parameters[P_PREROLL]*1000);
+switch (preBeats)
+{
+  case 0: PreRoll = 4; break;
+  case 1: PreRoll = 6; break;
+  case 2: PreRoll = 8; break;
+  case 3: PreRoll = 12; break;
+  case 4: PreRoll = 16; break;
+  case 5: PreRoll = 24; break;
+  case 6: PreRoll = 32; break;
+  case 7: PreRoll = 48; break;
+  case 8: PreRoll = 64; break;
+}
+
+// If first/num keys or arc changed, regen the keyboard
+if (updateKeys() > 0)
+{
+  GenKeyboard(FirstPianoKey,NumPianoKeys, PianoArc);
+}
+
+// Update key angle from sliders
+if (KeyAngle != Parameters[P_KEYBOARD_ANGLE])
+{
+  KeyAngle = Parameters[P_KEYBOARD_ANGLE];
+  for (int i = 0; i < 128; i++)
+  {
+    KeyArray[i].Rotation.X = -KeyAngle/5.0;
+  }
+}
+
+
+int curDir = Parameters[P_NOTE_DIR];
+
+// Update current direction - if we change it, nuke existing notes.
+if (curDir != NoteDirection)
+{
+  NoteDirection = curDir;
+  clearNotes();
+}
+
+if (PianoMode != floor(Parameters[P_PIANO_MODE]*1000))
+{
+  PianoMode = floor(Parameters[P_PIANO_MODE]*1000) ;
+  // Reset existing notes
+  clearNotes();
+}
+
+// Update tempo as necessary if we're not in a selected tempo mode.
+FindTempo();
+
+// Update note speed from slider....
+NoteSpeed = (Parameters[P_NOTE_SPEED] - 0.5)*NoteSpeedRange + NoteSpeedBase;
+NoteStep = CurDelta * NoteSpeed;
+
+// For player mode, start the notes 4 beats out
+PlayerY =   PreRoll*NoteSpeed / (Tempo/60.0);
+
+// Setup where notes start and their step size/direction
+if (PianoMode == 0)
+{
+  NoteStart = 0;
+}
+else if (PianoMode == 1)
+{
+  NoteStart = PlayerY;
+  NoteStep *= -1;
+}
+
+if (NoteDirection)
+{
+  NoteStart *= -1;
+  NoteStep  *= -1;
+}]]>
+      </Expression>
+    </ZExpression>
+  </OnUpdate>
+  <Content>
+    <Group Name="FLStudio">
+      <Children>
+        <Constant Name="AuthorInfo" Comment="v1.1.1" Type="2">
+          <StringValue>
+<![CDATA[Impostorem
+http://www.impostorem.com]]>
+          </StringValue>
+        </Constant>
+        <Constant Name="ParamHelpConst">
+          <StringValue>
+<![CDATA[Show Piano @checkbox
+Show Notes @checkbox
+Show Particles @checkbox
+Light Keys @checkbox
+Note Direction @checkbox
+Transpose @checkbox
+Show Velocity @checkbox
+Color by Chan @checkbox
+NoteType @list1000: Cuboid, Flat
+Palette @list1000: Prime,Sunrise,Dusk, BlueSky, Rainbow,Fire,Grass,Pine,Icy, Bunnies, Bones, Grayscale,Distinct
+Piano @list1000: Shooter, Player
+Preroll @list1000: 4,6,8,12,16,20,24,32,48,64
+Tempo @list1000: Auto,60,70,80,90,100,110,120,130,140,150,160,170,180,190,200,210,220,230,240
+ Fine @list: 0,1,2,3,4,5,6,7,8,9
+PianoLink @checkbox
+Note Speed
+Keyboard Angle
+Camera X
+Camera Y
+Camera Z
+Camera Yaw
+Camera Pitch
+Key Arc
+Num Keys
+First Key
+Key Set @list1000: Normal, Alt]]>
+          </StringValue>
+        </Constant>
+        <Variable Name="isPlaying" Type="1"/>
+        <Array Name="Parameters" SizeDim1="26" Persistent="255">
+          <Values>
+<![CDATA[789C636068B06740C13080CE6760C81762B646E6D767D9D84199F6C7BDCDEDF5EFAAA0A887E9070031310A92]]>
+          </Values>
+        </Array>
+        <Variable Name="SongPositionInBeats"/>
+        <Variable Name="Tempo"/>
+        <Group Name="ParameterIndicies">
+          <Children>
+            <Constant Name="P_SHOW_PIANO" Type="1"/>
+            <Constant Name="P_SHOW_NOTES" Type="1" Value="1" IntValue="1"/>
+            <Constant Name="P_SHOW_PARTICLES" Type="1" Value="2" IntValue="2"/>
+            <Constant Name="P_LIGHT_KEYS" Type="1" Value="3" IntValue="3"/>
+            <Constant Name="P_NOTE_DIR" Type="1" Value="4" IntValue="4"/>
+            <Constant Name="P_TRANSPOSE" Type="1" Value="5" IntValue="5"/>
+            <Constant Name="P_USE_VELOCITY" Type="1" Value="6" IntValue="6"/>
+            <Constant Name="P_COLOR_CHANNEL" Type="1" Value="7" IntValue="7"/>
+            <Constant Name="P_NOTE_TYPE" Type="1" Value="8" IntValue="8"/>
+            <Constant Name="P_COLOR_PALETTE" Type="1" Value="9" IntValue="9"/>
+            <Constant Name="P_PIANO_MODE" Type="1" Value="10" IntValue="10"/>
+            <Constant Name="P_PREROLL" Type="1" Value="11" IntValue="11"/>
+            <Constant Name="P_TEMPO" Type="1" Value="12" IntValue="12"/>
+            <Constant Name="P_TEMPO_FINE" Type="1" Value="13" IntValue="13"/>
+            <Constant Name="P_PIANOLINK" Type="1" Value="14" IntValue="14"/>
+            <Constant Name="P_NOTE_SPEED" Type="1" Value="15" IntValue="15"/>
+            <Constant Name="P_KEYBOARD_ANGLE" Type="1" Value="16" IntValue="16"/>
+            <Constant Name="P_CAMERA_X" Type="1" Value="17" IntValue="17"/>
+            <Constant Name="P_CAMERA_Y" Type="1" Value="18" IntValue="18"/>
+            <Constant Name="P_CAMERA_Z" Type="1" Value="19" IntValue="19"/>
+            <Constant Name="P_CAMERA_YAW" Type="1" Value="20" IntValue="20"/>
+            <Constant Name="P_CAMERA_PITCH" Type="1" Value="21" IntValue="21"/>
+            <Constant Name="P_ARC" Type="1" Value="22" IntValue="22"/>
+            <Constant Name="P_NUM_KEYS" Type="1" Value="23" IntValue="23"/>
+            <Constant Name="P_FIRST_KEY" Type="1" Value="24" IntValue="24"/>
+            <Constant Name="P_KEY_SET" Type="1" Value="25" IntValue="25"/>
+            <Constant Name="P_NUM_PARAMS" Type="1" Value="26" IntValue="26"/>
+          </Children>
+        </Group> <!-- ParameterIndicies -->
+
+      </Children>
+    </Group> <!-- FLStudio -->
+
+    <Group Name="PianoData" Comment="Data for the piano">
+      <Children>
+        <Array Name="ActiveNotes" Type="3" Dimensions="1" SizeDim1="128" SizeDim2="16"/>
+        <Array Name="ChannelColors" Dimensions="2" SizeDim1="13" SizeDim2="16" SizeDim3="3" Persistent="255">
+          <Values>
+<![CDATA[789CD596FF4FD55518C73F5B6DE65613B3B5DAB2AEAD39FBB272CBB6E6FC3C0FAB6CB5D574565B6E2DE9DBE6DA4ADC525BEB878B92428342201454B898655EFC820A84A87003C46CA057BE342094CB970CF1DB051311C13AEFE773CFE71EAEB73FA0BB3DFBBC3F9F73CE739EE79CD773CEB52C2F5BEECFCBBF040214D589D2B6A3FB5DB622FDF68C8D93D60BDBC3B61533FEABD45477FCF7DB1F95B6D1EB6BF8E6D817A2B76D7DC8F535144E165F47F212DC312B52EE64AD8FF67DE86A3DE670D57C57979795D1C4F897F2FEC38EC778C6F04A0E5F59C11706076962641577762CE59CEC6CC2DC75B52FF0477E8FF42FF13FC16A6E1BDFBFCBBD8F7B42A105D74756F3C4F83815FB7CF695CB9F725B6B2B6DCC4AA0FEBE0FF8E08103D4D4F81AFDDEF696EA9F4BEBD6AEA5E30D2FF3B5BF3FA32D0505545E368FD18E7EC879CFEEA7E8587D3D657D3B8DE1A3A5B9996E8C8ED2F98101FB8FCE4E79DF5F5A6A9FE9EAA212BF9F100BBE63ED8A7D1EFB743048295E8BF4AAAA7D70758AD7EB6A15ABD12740E9696936B4CA077EC8E96FB11EA36261352F39633DC85BF4FED2B99C9E76978A35CBC69E6F2F9E25FB783AB8980F553ECF7FF6F7534F2889F18EFC54BC7C7E6039B7342FE1D858D41CF6CF1515A2551E765363A3E85D3FCDA1BEDE5ED16AACAC07F4A6BC3C4ADB3045FC1CAAACA49CEC7B4577B4B753E1B699A2D1578D67F5CDFE26F31E2E3BF82C62A0A2C287B9A69AF8705515EDDBFB34FF76E255D9437C6B6B7D937D458F70F0D4220E752F139691C385C18FB9B7E73DC961E4DA2A8EE557AF9BA37DAE1E0A878DEF1E97CB13BFBEC2D13EC9A24F36BDEEFABD393646515EE79139DF99AE773833E36EF1AB9EFCD7B973A4EBA2BEEE45ACB7AD7D6F58BF3E6E2CB1F1ABBDB6A3DA326B998C3E7173346B5FB311F1E3E60886E2AD031832E672359889FA4CBA6DADF0837F7082D8C1A1A32DD49F68C49EBFF901DD076C8B46ECE0C2E91320C4008DD8C16DC48FC4030D7FD82F67AC476283C6B88EF6B7F55C122734DAC1B9E333496286C6F3C6E8E7ACD936EB10ECA306A01D1F41D1601F3500ED9C05CB45837DD40034D8470D40837DD4003472C418F00FF6510360049CA306C03FD8470D807FB08F36F00FF65103C80BEC230FF00FF6A37BE07084F5C7F9A9D9C158CD0E7C68760235CC9A9DD27DCFB06607F3697670F66976FEB9758B343BDD67CF9266A7A6BA9A343B458585A4D951673469768E1E59409A1DB506B6660767E664FEFF9F39D4D5D65266468618EE03C403BB3A3C4C6009774AEABA3B1877C6F18606C23971E9E245B0409BF2EE67B4E11DB1646F9C2EB1FA773D2E5C7C9D3E55CECADD254F726ECE0CC421E739D8C2FD05DBF9E36C89115651FE9CDC99B063F52F31EE3E586BCB1B7CF9D227627DBDEF33EE4AD8F0D04AAC8F1D35396F22966898D7309F6101C34286C97913B104C33C86CD352CD1B0C5862519966C9837C6A2E767417EFE7F9EAD93F5E477D47A41FE831487493777F4C1FF04F5D4FF9B0CBB6DAE98B678F15AD6BFEAC6876F]]>
+          </Values>
+        </Array>
+        <Array Name="KeyArray" Type="3" SizeDim1="128"/>
+        <Array Name="KeyPositions" Dimensions="1" SizeDim1="128" SizeDim2="3" Persistent="255">
+          <Values>
+<![CDATA[789C6DCE218A02010005D00926D32493C96432992C3BBBC164324D32994C269345100441181004614010840141100604417676B307F0001EC00318B6E90BFBD30B9FCF0F82E23778E582CFF884737CC407BCC719DEE12DDEE014AFF10A2F718217788E67788A27788C47788807B88F7B38C65DDCC16D1CE1166EE206AEE31AAEE20A0E711997F0F3E7ED07BEE31BBEE202E738C3294EF0140F718C235CC7A19F0BFEE0044776BE837F537CD08FD8C1057EE0F0939F38C2311EE2294E708A339CE3025FF10DDFF1033F71E9EBED320E710557710DD7710337710B47B88D3BB88B63DCC37D3CC0433CC2633CC1533CC373BCC0095EE2155EE3146FF016EF7086F7F8808F38C7277CC69797FF00C00C7F5F]]>
+          </Values>
+        </Array>
+        <Array Name="NoteState" Type="1" Dimensions="1" SizeDim1="128" SizeDim2="16" Persistent="255">
+          <Values>
+<![CDATA[789CEDC1010D000000C2A0F74F6D0E37A00000000000000080770320000001]]>
+          </Values>
+        </Array>
+        <Constant Name="Alignment"/>
+        <Constant Name="KeyArcSpacing" Value="5"/>
+        <Constant Name="KeySpacing" Value="1.5"/>
+        <Constant Name="MaxModelY" Value="200"/>
+        <Constant Name="NoteSpeedRange" Value="186" IntValue="186"/>
+        <Constant Name="NoteSpeedBase" Value="100" IntValue="100"/>
+        <Variable Name="BeatCounter" Type="1"/>
+        <Variable Name="ClearAllNotes" Type="1"/>
+        <Variable Name="CurDelta"/>
+        <Variable Name="FinalNotes" Type="1"/>
+        <Variable Name="FirstPianoKey" Type="1"/>
+        <Variable Name="KeyAngle"/>
+        <Variable Name="KeyStart"/>
+        <Variable Name="LastBeat"/>
+        <Variable Name="LastBeatTime"/>
+        <Variable Name="LastTime"/>
+        <Variable Name="NoteAlpha"/>
+        <Variable Name="NoteDirection"/>
+        <Variable Name="NoteSpeed"/>
+        <Variable Name="NoteStart"/>
+        <Variable Name="NoteStep"/>
+        <Variable Name="NumPianoKeys" Type="1"/>
+        <Variable Name="PianoArc"/>
+        <Variable Name="PianoMode"/>
+        <Variable Name="PlayerY"/>
+        <Variable Name="Preroll"/>
+        <Variable Name="SongBar" Type="1"/>
+        <Variable Name="TotalNotes" Type="1"/>
+        <Variable Name="TotalNoteEnds" Type="1"/>
+        <Variable Name="ViewportSize" Type="6"/>
+        <Model Name="NoteModel" Position="0 0 -1" Scale="1.5 1 1">
+          <Definitions>
+            <Variable Name="noteIndex" Type="1"/>
+            <Variable Name="vel"/>
+            <Variable Name="inNote" Comment="is the note hitting keyboard?"/>
+            <Variable Name="noteChannel" Type="1"/>
+            <Variable Name="noteIsActive"/>
+            <Variable Name="startTime"/>
+            <Variable Name="totalDelta"/>
+            <Variable Name="notePosY"/>
+            <Material Name="noteMaterial" Light="0" Shininess="0.05" Blend="2" DrawBackFace="255" Shader="noteShader">
+              <Textures>
+                <MaterialTexture Name="NoteTexture" TexCoords="1"/>
+              </Textures>
+            </Material>
+            <Shader Name="noteShader" UpdateVarsOnEachUse="255">
+              <VertexShaderSource>
+<![CDATA[#version 120
+
+uniform float uPianoMode;
+uniform float uNoteDirection;
+uniform float uVel;
+
+varying vec4 fColor;
+
+vec4 fPos;
+
+#define uKeySpacing 1.5
+#define PI 3.14159265358
+
+void main()
+{
+  vec4 brightness;
+
+  float shinyDir = abs(uPianoMode - uNoteDirection); // if ints, this'd be a xor
+
+  fPos = gl_ProjectionMatrix * gl_ModelViewMatrix * gl_Vertex;
+  float distance = sin(gl_Vertex.y) * (1.0 - shinyDir) +  (0.3 - sin(gl_Vertex.y))*(shinyDir);
+
+  distance *= uVel;
+  brightness = vec4(distance,distance,distance,1);
+
+  fColor = (brightness + gl_Color);
+  normalize(fColor);
+
+  gl_Position = fPos;
+}]]>
+              </VertexShaderSource>
+              <FragmentShaderSource>
+<![CDATA[#version 120
+
+varying vec4 fColor;
+
+void main()
+{
+    gl_FragColor = fColor;
+}]]>
+              </FragmentShaderSource>
+              <UniformVariables>
+                <ShaderVariable Name="uPianoMode" VariableName="uPianoMode" VariableRef="PianoMode"/>
+                <ShaderVariable Name="uNoteDirection" VariableName="uNoteDirection" VariableRef="NoteDirection"/>
+                <ShaderVariable Name="uVel" VariableName="uVel" VariableRef="vel"/>
+              </UniformVariables>
+            </Shader>
+            <Mesh Name="noteMesh">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789CED5AFB5F55D5BEFDCE0DB8017909BE80A4140C041F29BEC2505353D37C9F2CB3389946593ECA67A7A3E9E9F6504BD33A59462F527B989896A599A691F8C634C554500F861802CA4301853DBF778CB53D9F73EF0FF72FB8C5676D166BAF35E7777EBF638CEF98CBFABA44E6F90AFFDB79F3C07F0BFBFCE758763E33E7B623876B0B8A4412F71E28ACDF7FF2726555F51955F7A1F655C78233734A8A9F3F1E125CDEB02A323367E996ED4D45E6C6F408C8CEFBEA6B91E9E18B0AF7D564E7BDB6FEC35091CEFEB71D898DCE5F25D21010B254A4C2EDBBB24780487C93FAFD21C1E99F8AAC081E94B9B7B148ABA8F3170A8A9A4772E4356113F363A34546E496178CBFC2F3D3DF8BF83617E972ECF5DF448E9F2C3D2A527DC67DE8C55D22F991C782DB5765E6D4256F3A2312EE935E9C99239275B17A87C8BD65D9DFBE1FB7268C6B397B65441646A8CE58F37252F3C8CA2AACF6DADA0C91A1B5D3DE141955D763F1F193AAA54737615CE6E4C55D71C5272F33CE980B41D9220B1217E63126D5F28283ADBB9E0D09EE724C15F12C144972EF5AB2C12D72FE42AB28CE250B8FD7897C17913A446474CBA07E22214B4371257F954F8D48FAA7D330FB575F2F2F1739FD7D7D49E25ED50385BEDDE39B5456B50E13D9385AA475D8C6D1C3DB3092EF2244528714463186C3B5CCA76AE2DE6E31E73A75F62F280A6A23C2BB7283268D1799DF270EB52929AEACCA0D12E195B603EB4B44460E5B5EBE2050E4A14922ABC671F605813C8F4B673C953342EB36FBA316534536FBAF98CA95EC9B23B2C1BD6F4E7A71B84F66CEB2F322CC6A901351523CF39FDB9EB5D8D8A5BC20295EA4F4E8C23CE64724AFE78142F721D622C9CD4C38BFF1F96CABCC9C8D5D44CA0B72DB8BBCFEDBE89618AF1F31D62D665564794366CEB3AD5439CB06778FC58C84755910C81AE50665AC614E58C1EF22B2BFCDEB2972A090B9ADDE11941D73417583BBCF6C2F9493DCAA9C0B38A9E35F9C9BF5E58A86D6728D0BAF71ED5DAA999FB357368E665659B57BCB58AFAC8B41FD883A5EA99C51E126DA2BAB7A04D44F16F93074D6188EB66ADC8AE0BD8DB7A6F13C2EBD21607BD31983456E3BC28A4CCC27DE9E3FEEC5D8C861D3C33F0C7D6D3DEFFCEAEBE9E1DB9B2EDDC2F365E7D35288E1BA64E2B96947627B6602F1151E4BD4555611639CD77725EFCF5FD510B0B7F1A04C91A55BFA978A0CCAEC799599DAB58478525D11FCDAFA0915BCB3ED40DFE6FB6A161566E7852C55AD70137BE4DD3E54BA7E3F31B66BC92860B14700EF2166F22339C68A6059A89AE4CE5FA5DA1040FCE74756A71646A92E2AF4B25B757A3811EBDB3C392239223BEFF4F7AABECD678D21D35FDCA59A1F3972181560C6606A02595C50D4F52C5711EE43ADA89F4CEEC7A5530DB6A691F57D66136BC782A92A4EAD9071AA44AB28F228EB2211B26A1C554295DC57A52678D9D5E51851746F19D9312297B8A27A5456B51D48AD1855C7CCCCEF437D50E5D84403EB4D7EA9925FAA644D976A3205D123C3FB6A98ED9E57996755F25795D95B788DDC51256B54594755326542052B3BB496DCE95FCACAAE8A245F54994FF2F44021B149EC6DEC121ECBBCF33CB73D6B9D14CFBA07B5A94BA61E122DCFB64A4B610DBC2B9485897B8973AA684111739E9A487E758B5165157A04CC8D494D54A5C2A8520F559DAA9DA126A85227275410B1AAC461FF52A2F4F849B295394F4BD9574354AB12C3A35BAA06F5EB7995A81E5547367D17A1CA0C9005AAC47CEB30D58DA359CDB414EAAD2A953F35D1C1D362E661DA9BCCD5DA0C6635630DB33D228B35CAFE7641A0EA4393363951AA12A5AC6FF50E552270B33F303C951ACB7CA9EE9B931BA43A693CB5177165138754FBB862F682FA12F69AE5E5EC20D3AAD85F7C6AD85F42EB987F306B21D9CFEAC7155397D8BB182D1555F55019334954A726126FA175C4A44F0D9136AD8A185E5E4E14D5973CDB8ABA47452137A84B7D6673AD71E9E448FD64726A6B1A995839835C637F4C4B9931980C2542A6BD39721859336B0CB9A9CAAEA4CAAE44EC65AC210E4764517BA7BD4926F458BC6A1CB94CA4ADCDA08667AC6147189145343287CC2D7B81EAD05AD5696FF2373FD9BFA8D56929A3EA547B2C66D7E02CEC775DAA55590BB007E3B00FEEAB2172A8C08C877D70E135D5B5196D0792D14442F50E569F235063E7F721BBEF2DE315568AD17216D628630D9D405A0AB131222BEB229F65ADD766B02F34EDC80E55979C1C71A82C35716ECCBE1A22964ACB6C04F563F727ABD1B963C9E89909ECA4C42E9F2592EB92D97DD252E81CF82431C9B590BF546F2A4F5C312B959642BE748BA12721C6A8F05CFBA4F1EC3BE1B15C23F94BFDA776D597D039A4A5B01FCD4CA06351A58A92E1AA4417565AC53CAF98CA3CAF984AEDF5AA09334E94F2F7BE39C7EBBC08A1C6503F7D6AA8CFE00CFA5A5A0A7312D48F7A9B9AC85E801C438D55D90BA82FAAA175D464229359A27A83E9CE78D47C55F61DD53561EFC7C546D3E1A4A574F63FD729363ABE896FF79060F626CECF28D895B876BA97E6912F2785041F6C7DB035EFF15DC9EBD41C4403CD61EF000ADBABCE4CD8D845353C965D8CF7D09950D9784EAFD2BE8A59A242FAD45021799D7E863DD7AB56AAD44C5EA782B13B53A3E846A854F525416D54EB9293E255393B95906A0927D5C0B5308A9909F48DC406D741F5F6AA447D09734A0588B9204205E35CDE35D2C950BB7C6AA872BC429F43179196C2AEC42BF436E9C5AC02B54E95BD89911133EC41AA8551D5A9225DCF324B446278EC82C405895E0DE48844C2F036ECD3643167252AD88F662650077C6AA803AAE3AFB03AD481D03AE2B769472A03503699B82D29662DD8EFB82A628F33565651B7EB92A918AA272FB39A876B5959553A04F2343B8FB52E28A2F27831409FFC72123C792A7352973C1C0CE3EC0545E73AD1B7BF1F37FE4A4111B15159F57212DDE0C23CAEC87D8877B26B64E7F976A7AB67545E6F5F97CC6763A3793D24984EB869478E131B4DCE66E76D729C4ACC05E68A88F28E1C12BCEC3CB34DF71E1B4D95F63AE4F05876F0D868AEA8B28A3E796602D7C5D8D68471757492C41E7B3A3B1A11585E407C961EA53F0F093E7F8163121BDE7BD849E936F37AD22DD399A0CFC3338704D309C7464FCC67B4745FB1D17462DE1CC275ECE73D44A0FB105D1947666C4463E951BAE59060D6D78B0454663F33C01D506C3433062D061E98219E73F66E31CC272A974AE7C9CCA852DFB2F3981F6F7FC9CEA3ABEF1643FFE3CD52660ED99D9D47CC67E6905399395C634111F19999C3F80B8AFC255082A491F889AF34A80F0E7F1C6EB9AED5DADEC5EF7EF394EA53B8235AD6EA7821C69107DC7F073E03E4793C6371B8C4C04018E7F386D6AB9F9CD7463822A442A7E0DB0A5DA12DA45613A55EDB6386227CDB48AAF4A45A0D945BF1D414CC4503EFF33F46FADF9F57F4353DAD4325514A11C3358D97C5EA92E672BBB4C20C4D704F8D066126B7FC88B98CB491ED7A411264A024A8AF33B24B3A225A8F72346C4C71783F8DECD4B638BBAE1FEA598D92F6028B89B506C956C4176FFCB1D28D76A0044B17279206DD291BF52719A8A3E41E6734AB5FE93A8D3109C8CC367B11CF26C9BDFA0056F6EFE87DF0598EB84A94679734588AB4835CC65F6F6A0872F99073D7553DA5E7F447ED8E71464995FCA61552614B354CBB9979E6037D537762CDF5364A27C830B30B4F8FD52BFAB99E927464F30F5BAFB3B09E0064DAA3351A807103A54E5DCED8552ACE7A7F4775DC12EE54CA4F8E28EB102D19BA0FCF4C95EBB24637E80D7BAB8C910764ACFC2E59FAA936D199C87F7329D33918B35A8DFCAC134CB6DE2159B607B25A8DB14F6913E441F551ACDE5776A8B792DECA1829D647F40BACF41549C328EFCB2E3DAEDB6499E927EBED57762BD6F5A10C9501F2144670A1127E78B23122ACD6ABDA585A4BC8CD3C5ED7DFB50A5722A419B27745CB117508D61B29FEB8EB149E3E85BCBA1113B3598B9F2652894A1A698A18EAF50FFC7D047787483CAEEDD0307CDB03D5692433B0AA26A8FC14DCF512E2F405C6DC58B51B95BA021CB401D68A748FE6E91BC8D75DB240C8850854AA44C9208E7D5D43C194188C59A20DCA0C136D70C07A8BC421BE46721879C9D5045496AB0B74EAD35CA28094209C5769968E0202169805729B6CB161B2486F955844C3FAB981BC20E9656A91DFB1768F2E7270EDEF54D517CF33DB3077383BA1BF6A53B9533EC095A9CEF723751C22E92B3D659FDE23436486FCA233B4ABF95C5F9313760538E30FBE0E960BDA5A7663CE61C8A291ADD2022B2BC57AEB91B33FD4FF261F7D91311F202912EBF7953C3DA6CD705F34BE0DC5AAD60331DF2252E2D00F590CC05DE80732129FD1E014BA08981C2C67740CAE8DC0BCBF20BB71D21D79233F3DEAE5E619D4B25CE7423526EA7A54738DC34A7FB0E7777C334C2622825CDDAF7DA507F2FD13EEA9D4586989D9C2115533897432422C5D51B2A0052AE8C5905BEED37F62AEAF9D11DF00EE4781756FE90620F069647988BC07944580011518FF0BBD4BFFAE9FE839C9931F809C93607BAD7EADE9585F3A58BD13D79A490760F85DED87FA76C55A0648B2CC92D775299E7C4FDBC9DBA84C947CA6C7E45DBD0C949661AEF5983F16EB88D577E4037D46DE81D2AED66F107BAE1C42749F61E51BF56F58B15B0A11D5DD88BD17D6F13BF0D95207003755F29AFC4B6FD3294AA616A3726DF576BD5B0F2213879087ADB204888A97D5F225727A58BF95A3DA1315E98E91E6E9425CB3BA08C7AB60700346BE01DC7880E1BBE539CCCBDCBC27AFA27E0D3A5B96E05B2F0759214641FCB791BD4E4758ACDB50836950B308F0781AF256A577628ED9CA9C7F803906606D6950CC34E05CE4713C5DAAF36525D43B089C13CC889EACF3641EF0168F1193C0EF4A67C60E37B99F05665403BD9D1C7DFE4F77609711A0A802EA3D02CA32423AEBE3C8C514A0390C51B79275C0C019FB185050810AA6CA1E9D84D927CB190797FF57C7A90187EE41A51E00BF6FC3952D60C013A86D0B60760BAA2D4E0EFA2153B1F29C2C96187D0C99AD950BF28AAE46D59F46B613E4988E942750C967C19634E065A764CB6CA70379A081DFE9569DAF87B5971422832BF567D98C0C843A0836F2AB1E71AA70BB74847E9E4336EA9C956E049F059AB151D641F34EA3677597FB9D988F6817E9843CF3A9E3606D1E785306CD7A077CBEAE13651B6AD7147776C7778F613CB7F3547BDD83187F0263DF93B378F600D6D559FF0AAC889C449CBF42B32BC19A7F33C885DA1829D013BA0B19668502A12CCD303376AB78F6B2EE969FF177A56EC153EDD09DBC592D552AE36EADB56A9FD56ED20889FE15319C40DC6E47A76A80FBAE407FBD1E822E1BA72BC73A3DF6B80CC2792BACABB9D3BB545B6A53A0AC1CCE648FDDA09D91F749E8C10BD0F57D31AA20A3CDB0A25EBAC55ED1B3729F614EAEA16E5F6805BA79365657603F903227B65C7B06FADDC9D48ADA737602725CEEE4B097D9AF29E6045CCB8BBA180AD10148B88E6FEAD175A8B4BCEBB2CED46454B0B5E98839EED787702D04BE631BB4807AB505BA30448EC97609C6377BACD52F316E6F732F78F5B31EB3BB6D678CD50D3E231D7D7519BA39FDD636A87173E848B506E2A95CB4D61FB5BFB9210FEA8F36186BF533F53604B1F4379B71E73740FD47D092FB1DED5C238F398E8339DFAC5DB1E27BE51761DF7F0F679BF449DCFF30EE4BBBE97F36825795186183DE097C4C004EBFB46B6D2B196746E18779706395D560D16A60ED021064E407ED085D1D0924B117DF50AF9B32D0C4CFEC3C3CFDA879D93C6C2E01276BF15D2634B0B93C2ABD6F3AA837EC8B768936381D858E939DC3D7E9630F62BEFBCC2A30ED532BBA4AC79B345C69859F79E2F55A857A014C39AF63307B5BF902EBB905BD75223AA40123AF03135BC0BF5AD4CBDF6CD21CC9B77DF5945D2E91A68FF9D8EEB04FE8189364BA62AC563249C2D067B7D99DF657F40B8F53D94038BB9DF002DBA41BFA4C37A8691BA7831DD5EFC93A938A78EE947BE405D9640D8E22A02551B8BE2274D89FB48F0C80B6BE040EEC43E7EE8CCED1558FA00EB311DF0679C0CC018B8F68B55DA13EDA5B9F93E33ACAD4EB58F3B36D243BE11E79AD93EC966F853A7D1BEE5EA7F7E92B768464490A10BDC3DE638CDC8DA312B9DE0A97D0026ED025834D5B78C10C3068B7BE024C0A2ABE1CAA391CBDE786D27512B3F9404247288F47FF6AA2D40D6DDBAE21F0142D305E085CDF3FB1A6D3F649D34B13CC0E9D2E6FD99376ACCC30734C23E0E013FBB12DD34166825963D7D81A9D6DE69A6079D5B2FAEDCD211D8F5AD463AE0BE0B920237FC18C97ED8F380F365794791B2599B21868A6927D6C1BCB33E631B31E7F79F49AF59122FBB8D9ADB1584D2F8CF1AEBD055D7300B057089DF485F60E364150915F809CB6407523390B057C1B3DA75CEFC2BCBB34196B4D13BAE8A536587DE1F6A24CB079D45440A72A304B6FD42108881902856D818AD7004BBFEBDBA85984CC81F605C973761C9471B839A31FB15300CFC381A5E3364267D83BA0CEEFCA93A8EEE3FA2E56DC15AB7BDA1C028A26C33F67C1FBE6CB6F504283A8CF61E40B70527EE8D08FC2F97F04877B0DC7DBE853ED3413F787CA51C9B68960D11B6632705887E8D3A11549FA94A662757E1847317782099076E6030BAEA2FBED808AB737FB31E797D0F5300982CEB793BEE62A705B649FB31E4D34CBF1C441FCBDDD96EB363BD00C45DE6E80172330E6555D057D89112AE956255FFB0301D731CF32E8E8419D24F7982ED2D97150D859E94875A1032E851E5E9338D3C8CC02FEB6C0F50F30634D2890DE4892ED05BB4E5F3519D2047BB4BFE1F969B217AC6EB05FD86DC0F6BBB214F3FC848EB0DB7EAD7E7AB7B94B6A6408CEC6381EE20610EB42342B1D3FB24F3721936FE10E7FF33E14D14706DB68EB27EF9833E283BED0D87C055F6664349EFB145DE233B5F684F587663C6C9AE80E3CDBD3DC0D1C8F53B5831C2FB91DFE2707D90A806BEF8BFA5B7DD25ADBD98E9491A6D6DC6FFCE0972F637DFBF5804EB7B3ED5528E15C33D7A699E11A2E1D90F73078F0D1706CC3911371461059693E3616DC7D495F071E23C1BB27640A626C827D4B247ACF6D98F1337DCA16D8BE7251A6426F9603311FD862BBDE06A28AFDA1207741453374AFA602B33DA1FDEBD087AF6BAA894047BC6A87614E8FCCD62C78F52489D2B950F56F51D56C3D641A6C2FA9B58CC3DFF1FC1E0D342188340799F845DB9932D3CE0422778D51875FB8BB42B76C8B9F40D3C2F437CD80B932A7FBAFD7327BCD3E2D6126CA78C00FFA75EABDC1FEA44643D46DDDEA7255625F588BD143AC471A9B3D98FD3CBA732FF0EEBC3E817D6963789D776C0BB3CDE6998BC8FF59ECF03BD836526EE743350A651A74067B0BA990449B8EFDECBD32C8B491AFCC28C45DA907953B8A1E50855A7DC07E034CDC6FB2CD6A78380F3A559075C32D6C974A0905EB0E22BA933A482BE5B258299166A601DE632CFAFA33BA0058FE18BC8EB66FD9355A671EC4AEFD3C7AC06A1369A3D0292E1B1F6434182B1C0267FE047A428D7D1C08A17BAC70F652ED1C9FF78752A946A23EBEC6D7B8B1DAA6A8D4ADC6424F6E9544390D94FE0D8A54AB8FC82DD2181509971FD13BA3A40FB8715253EC77E0F74EF3AEE9232F83AD77DA3F6C0EFAD07C73C65EC2AC014E9FB9A1930DFBDDC796EF2658C9316638783CD2DE8FDEB6D4FC605AC3CFECD502CD051B93A437F276527798A6D21E9A721DDA9B0B2E7CA9D1D6571EB1C7CCB7F647707C07505F66BB221307C0A400B943B85F1D6B7E34DF9930FB0746F8DA4463BE4BE8903570E343B0A62BFA87289C41826D071C6EC6E809D08B53E01A744706D8B39A6AB7C29DBC67E2706F63B984EE142B77D914AC3558F69BE9761B7AC777E8F56150D11AECC4B2514776B38326DA24C90D4FB29C563F57037C7D26FC6931946F1DDC706F198C3DDE65EDA2A3E108FF0285CCD57FBF01CAD5D16686D44B77CC51AABB4C4B09865E3F64EFE3AEDDB412BEA3F2471E4F82B567B5A7ED6BAFE91630F20E68FF70A98783736B1576542598F971F4B5383897E7C08454742437F8D9094ADB13BAEF81667F0CDC7F8ADFD5FA10EEA222952223E2ECEF07E94C895776B133E80E3351AF97B0773F0107D707DEFE04546A99AD02824E60ED8BED5BEAB28F9940573DFACD31B8FA30B8D2D6E0DE6E6D665E322192A4BF4169B7830D97ECEBD873EFC49A0447B5F3462B4A8BF96E08EA1CE1E0A1317776D2D4BC849EFFA83D0B71DC853C279B8EF2B03D09967F6AB602733FC12F87C1B105C0AB3C20FF25F1F6157904BAF93D34E31DD3DA9ED2B7ECCF18B156AEC1E7A10F3BFDB9DE59A73A6FA37C9C5D451D3834451E44FD3E74BEBB077DFB6574B83A998BBF3BC97C7B807D107DF1307A7C3C3A5C2B79CFFA6B8EAE304374B2FD4D57832D1B6C07B88761E84607CD3EBD0435EE844ACDC50E61AF5D0475B94F47C3AFB4745D337570D31FA2BA6BED2AF3839D2B799EAD40BABFEB233349DE475CEF63572EF2A4BC05C4F9DB291651BB36433FCA3C11F2BCD96E3A988FE0226264173C5E9567307A4D0BD75C09354D6D3BE38B181FD501A6B12B5BBE91BE9825088EB7A32DF4B8A4DC649A8966B17D41D6DAE74D89C7CFB5D2F22D51B63C05049F43BC0FC2E16097E5F8FC3227177C1F4AC686633F3D47AAE51978F217E0C267999966BAF9452B3C973D11F616D709536186696B6D0D971FA071F6A25922CF60DF7D27EE1B6AB723F63F4C9CDCEE0AC458ADC1E0F9E66129F1B4B08F68BA79DAA4A36B5311A8440137DFEAEC74FC7C3BECC862D1B9BB635710E420F32BE70DDB25CD96C332CC9EF2A87E63025C35B8B6094F24C81CF8EB2D6A5C0F68920DB50952004406B892B50C6B6CA4173C759E00D74553608E788682CB9F8BC733CBBEE2ECBD3E371BCC65EC6C0EE1BC1CD93804EF7214BB9BBF3BFBFC7318EB27AD3243E429F9CDD3CC5EF7B4735D35A1AEC39E1E3612C8FD46F33D63A4B9ABAD6BB3167B4E7A0ECB476637D4281EBB1A1F39255D6FEEDEB8C6E632CA19731178B11533D2A3D66ABEB445C53BE0B7774778558F624F790BCE1AC191BF88BDC71BA8433658380528A77697C2B18E42460EE0188B1D62775D2747E4003AF158E57ECC0541F95C2AA1B3BD95DDADA5F07F9078DB793FA4D8F5B1BFF38D426F65C71E687EC59DB59E3A27F3A71D667443205030F4F291E616732B3CE855E7AD52B8F05DF745EC0AD92FC8E352DDAC0330F30078AACB607A2F876D7471E4DD418EAC9F986A7D0ABB42326F80ACC4CEBB9732137E6635C639A87374097EAF90398876BAAE90FBE4A04CC7C82E0717C9604980FC0BBF53B5BBE3982E21A70D5002EEB56E38DC2ED3968E7AD561877C06392A9381967DB30A238C937EDA4F1A9C276B95BB2FEBE4BD3976A835FA3CEE8891FE783E0C0C8A84F7A856A272A2D90326053B6AE17154A4BDE33A8EEA5228E94AFB3CAEAD3277E173BEE34ABCEFD9CB80CFDEA8F59DFA3E5CCA12E74D500B67CFBC19FD499CB788FCE4DBE8F09B2AE427DCB7F0BD5D0FEC82AF6A3156E60BB5B986CA3640A9899C5670D98F61BFB7C479FBD04496E90C208B637C2133651E1CE41CA722CFE1DADFA1CE0570BEDC3B7E20AFE92CE0ED1FF8E62A7E9E113F6717EFE3CCD9D889A51888F085EA2C07D3A6E2DE5F6C3CD071B7F1EE5499B726CEBBD6527D186B0C932F110D764FE05C27C479DDD9CB6E842B7E12775ED1FB908926F0AB9FE09CD86B8723CF721F16228C3D0C3BD7AFD157BEC01C0FC817E869B9983708D1F840B343105380E3EF8A345FDBE26EE3F02042F2B5C1D1EE695202DFE3FD770CEF1BE77F3A9EF038325507EC2C70703DD6792FC93D50B473579CECC44EF40AAECD44BE67A2864D9D8E938B7EDAA06330E76A6DE2CCE472F29BE97061880CE3FB039D803DD71638A997EC5FF1ED3FCC0B96B99D075F3E528769A95D87BDEB2270C34886E1BF181979023BBB01966FC27B603764ED4BE67B3C52ECBC1B6FE9F0739BF2AF2CFDD5B6D50C932E05A296EF927CCC79ECF1DA3868FA12A3ECF13092145747D71E8FD55F3DDDF17027971F91E861F5BABA82B017DDEDE1C856F9EF3743B08F3E73BE48FF3CFE3CFE3CFE3CFE3CFE3CFE3CFE3CFE3F1DFF0D7E09B72E]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+          </Definitions>
+          <OnUpdate>
+            <ZExpression Name="UpdateNotes">
+              <Expression>
+<![CDATA[int doRemove = 0;
+
+// Move note
+CurrentModel.Position.y += NoteStep;
+
+// Update note's length if it's still being played
+if (CurrentModel.noteIsActive)
+{
+  CurrentModel.totalDelta += CurDelta;
+  CurrentModel.Scale.Y     = CurrentModel.totalDelta*NoteSpeed;
+  CurrentModel.Position.y -= NoteStep/2;
+}
+
+// Base note width off initial velocity
+CurrentModel.Scale.X = KeySpacing * 0.5 + KeySpacing * 0.5 * vel;
+
+// Is the note currently crossing the keyboard?
+if ( ((NoteDirection == 0) && (CurrentModel.Position.y - CurrentModel.Scale.Y/2 <= 0)) ||
+     ((NoteDirection == 1) && (CurrentModel.Position.y + CurrentModel.Scale.Y/2 >= 0)) )
+{
+  inNote = 1;
+}
+else
+{
+  inNote = 0;
+}
+
+int p1 = currentModel.Position.y;
+int p2 = NoteStart;
+int p3 = CurrentModel.Scale.y;
+
+// In the player mode, we don't want notes going past the piano...
+if (PianoMode == 1)
+{
+  if  (inNote)
+  {
+    if (CurrentModel.noteIsActive)
+    {
+      CurrentModel.Position.y = NoteStart/2.0;
+    }
+    else
+    {
+      CurrentModel.Position.Y -= NoteStep/2.0;
+    }
+
+    CurrentModel.Scale.Y = abs(CurrentModel.Position.y*2);
+  }
+}
+
+// If we're inside the note, we don't want it larger than source->0.
+// Otherwise it flows through the keyboard.
+notePosY = CurrentModel.Position.y;
+
+// End note if it's not the current one
+if (ActiveNotes[CurrentModel.noteIndex, CurrentModel.noteChannel] != CurrentModel)
+{
+  CurrentModel.noteIsActive = 0;
+}
+
+int key = keyFromNote(CurrentModel.noteIndex);
+
+// PianoMode 1 is player mode, 0 is shooter mode.
+if (PianoMode == 1)
+{
+  int clearKey = 0;
+
+  // Clear the models as they fully cross the piano
+  if ( ((NoteDirection == 0) && (CurrentModel.Position.y - CurrentModel.Scale.Y/2 < 0)) ||
+      ((NoteDirection == 1) && (CurrentModel.Position.y + CurrentModel.Scale.Y/2 > 0)))
+  {
+    clearKey = 1;
+  }
+
+  if (clearKey)
+  {
+    doRemove = 1;
+    // deactivate key here
+    if (key >= 0)
+    {
+      KeyArray[key].isDown = 0;
+    }
+  }
+  else
+  {
+    // Start the key down when the model hits / while it's present.
+    if ((key >= 0) && (KeyArray[key].isDown == 0))
+    {
+      if (inNote == 1)
+      {
+        KeyArray[key].isDown = 1;
+        KeyArray[key].lastChannel = CurrentModel.noteChannel;
+        KeyArray[key].Position.Y = KeyPositions[key,1] - 1;
+      }
+    }
+
+  }
+}
+
+
+// Set note color
+vec3 curColor = getColor(CurrentModel.noteChannel, CurrentModel.noteIndex);
+int colorSet = Parameters[P_COLOR_PALETTE] * 1000;
+NoteColor.Color.R = curColor[0];
+NoteColor.Color.G = curColor[1];
+NoteColor.Color.B = curColor[2];
+NoteColor.Color.A = NoteAlpha;
+NoteMaterial.Color = NoteColor.Color;
+
+// Destroy note if it's out of range and not active
+if (CurrentModel.noteIsActive == 0)
+{
+
+  if (PianoMode == 0)
+  {
+    if ((CurrentModel.Position.y < -MaxModelY) ||
+        (CurrentModel.Position.y > MaxModelY))
+    {
+      doRemove = 1;
+    }
+  }
+}
+// Clear all notes if flag set
+if (ClearAllNotes > 0)
+{
+  doRemove = 1;
+}
+
+if (doRemove)
+{
+  if (ActiveNotes[CurrentModel.NoteIndex, CurrentModel.noteChannel] == CurrentModel)
+  {
+    ActiveNotes[CurrentModel.NoteIndex, CurrentModel.noteChannel] = null;
+  }
+
+  @RemoveModel();
+}]]>
+              </Expression>
+            </ZExpression>
+          </OnUpdate>
+          <OnRender>
+            <Condition Name="ShowNotes" Expression="return (Parameters[P_SHOW_NOTES] &gt; 0.5);">
+              <OnTrue>
+                <RenderSetColor Name="NoteColor" Color="1 0 0.502 0.9"/>
+                <UseMaterial Material="noteMaterial"/>
+                <Condition Name="meshNotes" Expression="return (Parameters[P_NOTE_TYPE] == 0.0);">
+                  <OnTrue>
+                    <RenderMesh Mesh="noteMesh"/>
+                  </OnTrue>
+                  <OnFalse>
+                    <RenderSprite/>
+                  </OnFalse>
+                </Condition>
+              </OnTrue>
+            </Condition>
+          </OnRender>
+        </Model>
+        <Model Name="PianoKeyModel" Scale="0.1 0.1 0.1">
+          <Definitions>
+            <Constant Name="ColorReturnStep" Value="0.1"/>
+            <Constant Name="KeyReturnStep" Value="0.3"/>
+            <Variable Name="currentColor" Type="7"/>
+            <Variable Name="isDown" Type="1"/>
+            <Variable Name="lastChannel" Type="1"/>
+            <Variable Name="materialType" Comment="0=Active" Type="1"/>
+            <Variable Name="noteValue" Type="1"/>
+            <Variable Name="particleColor" Type="8"/>
+            <Variable Name="pressStep" Type="7"/>
+            <Variable Name="visible" Type="1"/>
+            <Mesh Name="KeyC_Origin">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789C354ECB0DC2500C73DBC7477C2406E0C008AC0037A6E84A2CC1029C3856ECC199011005F567EC54247A8EE338D1DB00D8C25155E4F31E14B783F811D8AB5E7680F1F400FE6805301FD1DDF53C6259BA373AAC31C2D55373A3FD5633144A4F3324611FDA1C2DA7B1DDEAD931302147CF9603ED9F28C7DBF6345CC07BD60B555F33FFB0E32BF83AFA814BD47CEBC20C2B75401F3FCBF592F63234E2B9BCDFD013BAB8FF035378756B]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="KeyD_Origin">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789C358F3D12014114847BB17E5640E0000231AE40E6147B15B973C85D812A077000B15480AAB5B35AF70C3B353D6FFAEB37F5760260A61DB83892B793CA2D7058A95E034B9DFB2960DD5C81BFDA015C272D4B60374F6A723927B5435AFDD92B4BD249D29434B59ABAD77EBA67686BD9CFD09136D12B50B31F5FAAB4DB220D53A62BCAE805560C746F4FCB34E55BC8F1EF6DF44AAE0E484D9ECC62BEE69BA91E4596618C07EF7CB110B55F60A854FA9B979203F9E1770FFCFCE6F41CAD38BFEB8A9ED4F92F49C68E8A]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="KeyE_Origin">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789C4D8F3172C2301444570E2436130A663800450E902B40C715D4B8A5CCA5E8A9E9E01ED47464D2648C1DBCEC4A9889345AFFFFFEEAEB7B0EE0035E5F07F27C4C21764BC52BE053DFED02B0AE4FC0A02680E3AC750DEC37595D21B39A9031E6AE66753DD4ECB7F2DFCAD518ED0878D1B6336024BD253641C731FE14FBD811F0AAC394D9115469D8D1D99BF630CD55F43D39CC27CA03FAC45B9628122F51A1659EB451874A4EBF533CBAF4EA4B168F7F2930C68FE6BAD077AB444BCC9E2F36E295F45BF154B4E32FEF0A71956A]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="KeyF_Origin">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789C354EC90D02410CF3EE0E8738240AE04109B4003FAAD856288126688017CF157DF0A600C4A1BD8C9D1589C6711C279A1580351C55453E6E2247E0BA13DF035BD5F306301EEEC01FAD00E603BABB9C062C4BF746873546B87A6A6EB4DF6A8642E9698624EC429BA2E138B61B3D3B7A26E4E8D8B0A7FD23E570DB9E9A3378CF7AA1EA6BE61FB67C065F46DF738E375FBA30C1421DD0C5CF72BDA4BD0CB5782EEF37F48436EEFF00DDF875EB]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="KeyG_Origin">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789C358F3D12014114847BFD5B01819C40247205320710EF555C4622172BEE21960A50B5EC6ADDF3A8A9E979D35FBFA9376300336D727222AF67955BF2B854BD02163A7753D3DD747D01FE6A07701D5A14C07E1E6AB23984DA21AD40F41405E924694A9A5A4DDD6B3FEE199A5AF633B4A475F272BCD94B2F95DA4D919A91E9883279154B56746F57CB34F20DB4F1EFADF54A5B1D909A3C98A5FC9B2F463D4C2CC30877DEF8642E6A3FC740A9F8CD53C9BEFCEA77AFF8F9CDE9391A697ED7253DA9F35F3F768EC6]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="KeyA_Origin">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789C358F3116C140188467439E8882C201140EE00A74540A7DAEE2321AA7C01D946AAD02EF9130667663F7BDD9F9BF99BCDD8C014CE1B53E92D793CC1638CCE517C04CE76E02589717E0AF26807DD2AA02F6ABA44E36E7A426A4D5CBACAA483749A7A453AB537F6B9EE6808EB6794057FA892CD3FE465F2AEBC456C38679DB459C5F229E7BDAA6E62F66C85120F90F0B4D41691E930743ECD77C33F961CC0246B8F3C6274BA5E625066AA5BB9E6AF6C59B76F6AD993A35EBF8DABC7DEF9B5DFD83FB3F912E8BF8]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="KeyB_Origin">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789C3D4DC10DC2300CBC505A104888017830022BC08F0733640456601976E00B7BF0660054556AD21E3E47C551CEE7F3D9DE02D841717B929F9708F0381A3F0107CBF73D203CBF8109A500E20563042ED782EA904285728CA526E511F21F4040654FDD80B9E1E0DA12893546E3D97E71D48699BD394A5563BA944C5D4173D2351B7C3631B3C1CCF5060BDF257F6F7AE5FB605DEDA75FCAFC726447F9373E33708D962D7F06C7738D]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="KeySharp_Powder">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789C3D8C5D0E40400C8467FD44789238D13A8157B7F1EC142E42C4ADD8D8D16E314DDAAF9DB60D8016AA7DDFB6F9109880C10BF7C0E2D5F1236979ED94349B80AF1AE197B243F6522E01E9ACBFD3A6B2CDC99315029D702913FDA45C487C7F2303232FB905EAE4910F4CA74757]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="Alt_Sharp">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789C3D535D4C9367147E3EE81F526D15A5288EBA024397A2C149E6CFC5A6C164178BD32564DC2EDC119371BF2CE1DA1B43B20B137BE5C53AABC13963166F4C7132A2219B30A7E22C5644C5C9B6A2C522D03E3EE765599BF77CE73B3FCF79CE79CFF7298053B0DFAD6CF19BAFAE3915470F2E5D3D7108281C24AFD46532E4CDEC779237B2A603A70F9804C83167214D760DAFEAE6B148C0B2F0FFEFF401C0D02C6F559A75CC455AEE68FFE791E9C1780FD97E3E37D45AD7970EF592C50B5D173B3724CEE4860EAF9F4CE58646327DE97CFA78B4FE5429958D7CF6EDDE9396858164243C38DB6DF8B18CC9CB472C6BB6DB983CEA36264D1993B18C5946FBC92F7FC400B9EFD2DE93A69752562BD46B98F9B47188F75895C431AB9B38667C2C9E9CED36B68D5F740D7F7D6EE67B93B18C59462AA6EFF74C62E0C4BC455A77B18CC978CFD9E1F6F3A1DE899F8B1746FBF78C58F51F46F65DB21EAD0BB39452E6B509585D7232954F5BD6E52364E28C59FAD2C6DCFA25C383B921B3745D34AFE9C673FA8ACDC710AC234376F1F050A5437A9A79B5B480DE7D586235CA3AC00AABE40DC2AF7F95FE15BDAF70350F305F40CFA043283B7B1845866078DE7F728965BE71150CC1AA3CE346CCB149196516B9C8AD986714053DA3F2FEEDB6A5C229452DCA6B99EFCA5E875AC95AE13F51D5309ADCAED82989A10FC6D787875C61039A91E32DFEC536BCE1163CA555DDA60C3F96794FF8D5D8E138478553E2286FB006EF61276ED38F09EE14CA1AF16E51C6B418E4A5CDB015F7D98C3FF51C573FD5486297B48A5092C8735CB80B6E6E41D5F4897948E7436C47275E2B2A8875E244BE1696F9039AE38A72436E2E9EBC13BCC365EE465C8CCAAEB325F5F98770C36893F515EB5023DF021F885D15D6EB44C52BAAE7215CA5E5FB15B115EDB0F9BD10EF5F9990FE91B03E96252B5CAA530FC6D1EF6EF2A5580435BB45E9B39C633B62D88417EA27802DCA2D0BE303F7553FD53C77C943FE264B0DF6E0BA98E4C5E57D245C0FE3EAFF016B35690F8DBAE116BD15695DAF458BB8E6F85C3D7DA21E9655AD435163AA5E66521BD18129DDD4A46ECCD3BCEEF227F1F7A141370F6CC602FFE1A49843EC366AEE6B54FF1AEF73869D78078FF9929BD18AB5BA699FEAB6292E819BAC17AB80F6695EDE79558E20A2DE02AA765BFD75286AB7DB2BF2771674DA3497B2501BB141A873DABF82A6EDA15EFB64B59FB3A4AD2CEA1BD8A15A53EA2122FB32A7B94DBD35E39176E30EFFA57D4749F55610BF06716D12DA26FCC2C7CAB5AFA245D379A63A4FD47145B3890BCFB6FC2DF2248AEB]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="Alt_C">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789CD5534D4F1351143D33F4130B01A9608518226A9A26221BD33526FE04C3C664D81848D842F805B8340DEE252126EC5919620C1813372C64E1066CA258C2A06DB116E9273D9E3BF32B9CC97BF3DE3DF79E73EE6D3A03E019ECF9BC0BF81F8223DECEEAFC189899258F1E0E8D91EFA701F2E5CCC1138BAC2F93070F3EBE5ED8F43C12B01CC0503BAF2F03869221FA2637BB6B5F5BD3E92072FFDD17E0D19D6C910C518B6C170CDB2E789E79082BC29CCDC91787B6678B40E824CCB1F8FC12B9D2DE5F25F3959D45EA29AC915BBEB1CD950B6BC096BFBF0AE42B5647CE2F012B6D63CF163F3DB7D8CEA2ED0B9BB6EF6D18FAF495E59B93B9B2A98499A63E9DCE16F7363CCF723C2F5F7190918F3ED4388401C4D0661F5C24E188AB410711452BACB0CE5124D0E4192F398611F4A34E17D7547BC51E5388A2CA0EA3B8ADBA362F78AEDDC1B898AC2A2E3EA025C6247C319C322D9549A4704BB81BE87EE711AB9C905E5DF8A02AA684DCC4254FF84B0E3272995124239E8416D0906E857FF883E3727243CA49A994E4C73AAA4A278932CBF4E5AB23B78E5C22F0D7AFBE2CD654B75D9ABA233416A01D46E42AA2FBB14E71BD2DF15BAFAEF009FC15D3B1B81BEACAC53DB1D4E4604479C3EA05CA3B932F5FDA757635079B50542B26C554C07B5D7583CA1C5506F953933DE4B03CE41477D5514BBE46E4C694BFD2BE53CAAEC963574C25E9C7757770A1AA0BDDCEA5D3D6449DA0C3A826D8E495A669DD27D0535646918426D9D3EB04BFC880B8FAF04D75A7BC2BB69C56595E4E6827FD19E4E7B7B048A09446F1B8C4FF79FD0316572767]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="Alt_D">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789CED55FD4F957514FF705F1E0853404D508481965ED4102D51B3524C5D667395D62CDBC82C90DE33CBEC07632D5BCE8CA60EE94D8D2CD7D85A99BA2E9A44DA8AB0099A69E44D05D42B0A58CA8BBCF8E9739EDBFAB1BFA0FBEC399CE79CF33D2F9F73CE97D500FA458920500984BF83FBFB2247FC74202B87FC7D6C7C22B9371320DFCEAA9D699275CBC8DA1BF76F22B78ECAF95674C49E23E4846181D00F4D6F790221B234ED8DBA3F5AB23DC1B0F126C9CD0516B78C73B58A16FAB1E367D1B4B6F1518190E7DBE7FDC1F0B28A47FCE4895DDB44977703C17063975902E661628CD9173B8F8ACEEDAC9136D96FDA2FA38D7FD367F6F9A5F78D22CF368FF1902BC23B45A75D5A14455EEE774051D2132C9F9C8E9F54C9070996C962F92FBCBA3075A93710AA1892285ABE84FADDD365D5E6971A5FFB7D84E6E64678C07843C930010C1F20828C9D32C9BA65B2123E40041F3B2B5E28952F7965AEFC549DF499C4105B5F5BE8F286D8EB75F55EE3CDFF9A4C8BBB263372D62ACD3EF59437C2476CC82FFCC6CF7102A27B63ACAEC47E1B546F527F43C0CE46FC000B07374852956A1ECA47C62AE253991637654A863F106A4959E10D867BA75A17664C2B90247F7E9C1308ED987B52FC9A69D697AA49107D5911DFEFDE9431D91708EDBCB1C8170C1F2F5826CBAAC50B4451582CBA7BC55AD1D6DA3765F3E3811F44B79E3284C7872A45E3334D3EBCD84E9D285A295A5266B1DEF864B4A8F7EE0A45C99E9FE404C325F3FD0E59BD9C9CD85CB48ADC165EF424F96257E566A3F3D69B1C855B6459F3C85459EEAEB0CC63CA4B44F715AC94BCB5E069E795DEF2258F4B8BC2CDCEAB4DD5CBDF712636BFF6DC4AA7F7F2A227973A2F76D5147EE8DCD254B46AA3B32DFCE0AA129DFA5E7C307CD721AB2EA1DE90A92AB37C6E2D369FF96596557E6996E898E2979DA917E7AD7F553E2B37E7C85BFBA659CE8757A270ADBAD407A3E041A7D0F7EAEF418E43146CD53CA247D8C5B1B822DD018E57DFAEF257F6412C7AE895851F3EC42146DF0EDA78594F347AE9C8CECE77692E7A1887FED25E65BB7C44FCFAE4B997E6DF8B5BC5C5A29A7FB25BCFF3B81B0F620B77B24C913C3A05E99B14D183449DEDE025FA142D411AFB452BF71859583C4771BCA8530E7FE8D4115EAF1CC72ADA4DD234F20A6390FC6F559689C7A59DBCC06B300449B2F94DBE4762185A5473AFA487E5F5B862F4B0BFE48E9E761EA22176BF10BB1D1F710377B18DB65E6354730A866290B2F1A0891665D03F38783145F693F1150FB244E71D64E0571EE7315EA73AFCE827EFD7A90E084B3BDDC36686784699F5AA1A4309C8944596308E733138AD5CA3E51F2EEAC03C4C420156F35316F101DCAB3CB78BBF0F33C507F9957A7695B3305C3577A9B661D21BB2F5AAB7D5CDB09B63946FA67C1FE709791C2A59A322A408BD28442B833F59C52F85E2794D473527C84317F7B346A7B3B00033945D8B50F208F75626A8EE233CC7912EDA3EB73A2F8EF127D6AB9A580C5426A9EE1CB4B35A881ABEE3D5C90BFC8B1799A549AB51A40CE59A2EBB39D82E2C4E2B2E7088B5F2300E770AE921087387A25C1426DDAA2441FA24E57946E80DC265F5FB24D3F4CE86E5B1835F2BD73845B1CE8FC660A157A9D856BD450A6022CE73847A9AAA3EA5A0810394D36469B7B3912DC2AC5E6FBCF03A29FF43C579DDBEDC8CBF7827BEE3404992D5CD43BC01D9EAAEA39C807D7AA7C8A653D95CA3C77EED8AD9AA996F57257B340DDD9CE44EB379339B4EDA26FA71947B64310B79CAB489BFB3413825B8BB13257C47886B90B48743A43DAA0E8F460039C2C4B47DD5C98F95836D593B1335053E6CD4778CB6EB334D76BC26A65967E14E50AA3AE2D77783F007D2D017977856739DA48A06285A937C16D3361CD26D65BE72C8D3DBCCF78445B4262F1E9B695FCF6A4B1F874D700C36683BD6BB778ADF458A5C8C85D294F233D5BA50A7F2B0891BF5DC8BE7B451C9CA74A06BE757DE1D42E49CBEDFE560DD3E0FA342BBD057531EA9A95ED95C0BEBEEDBF255C63C495FD0EEEFD3E4B4E9B668531F5AF4CE92B7DBD48D019AE469B23FC178D8C4D2BD7DEA788075B29AA069790036574D9AF23ADADE67A827C764354ED3734E7EB3D5E3E9EE2EEFE637B41BA0BFF6B643BDEBD54ED80D1AABF93DA7935E65779841A19A865BD4FB74D8349DE26A49D2F1124E0B77DBBEFDAC64326EC31DF886D6B599EE7D54AF7A5AF98B6CE23156BB4BF571BEE40FEB5EA6BC0E83CD44BAFA99E222D1C3F76977481E8A84FF2ECD3154D751F73FBCCD7DAE22246BFFAE088B28F72606EC8EEE71BB1FD65D725EFB6333F5392B247908B365EFFDE7A6BCE0DA24E18C36740D3FE13A2EC533EA9D0F1F68C78AF904D6F231592DC23BB26C71A386EA1BFF7FFF7FFFF3FD1BD9F34695]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="Alt_E">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789CD5514B4F1361143DF368A114140B14AB3C26600C3111D918D635F117B071D7B0A2095B08FE015C4A027B481A13B6AE1B63AC71C78A44376A35698B3684521250E8147A3C778AFE076732F7BBDF7D9C73EE9D5900CF60CFF312507F1FB9789D95FF0498CB925F1E0D8E926F6701F2E5DCFE538B6CAE90FB0F3F6C93AF1E64DFC9DE7FF3897C3C3553260BC18BCF66CD0766CAC5BC759A4F6EAC03BBF5BD3560BEC1E8595C0656C36E1E3016C01801E3327F73A598EFE68DF1AF6FBC4B856B5FEC80B103C66ED6FC5CCED072B92EB6454C43316F11B380A1014B058B97764CC9DE1A39DFD8582777EB0B5BA67371995C0D4B3B6617B62CEBE2263CB84273F5FE665F7486CC60140EAA3C600C97BC81533AAAE930810BF68BA123AE386268EB6C47CADB4CEA3EAEEE5ED525D1A2273C4376FEE19B3DE729E31850D4DE1EA177D8A38C1765C9903E0CDB91EFA229FEB2D02F39AD1EEF1AADA19AAF1CD239861A07C49B917FCC43A6D5198823A5198670252EE0A7F47FE7842AC715B1FD541928EAABCEF6D8E4B0F02D33051FFD9A1A420B857BCC4924359303D354E7057B7117BF58E347B6B41153E022857BDA628767F2CF78A4D3C78832876C4883AF378684B82A52735BB738FA308141F184EA48E388E7420CD9E488586EC1BA9AD1E686756BF244FB71E144B34FEB9ED01481F8629A2423E555EDF320FA0356E5E10E265191BE6FAAF414694951A0FF998A367EC5367F488B274D63EA49C3765455ED89BE72A5C6FFF1FB030C430A8E]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="Alt_F">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789CDD91CD4F534114C54F5B1E1111A92042680BC4B4D898688909E91A13972C09CBD71D246C21FC05B82404F6923426EE5D19620C18972C64A10BA041B03425504B29F2F1683D9E3BEA3FE14BE6BE3BF7E3DCDFCC3C0390837D9FD781F247E7E2DD98FCE7C0C818B99389F6921F9E02E4E2C8D60B8B2CCF925B4F3EBD225F3F1E5B971D7EFF851C7D982E2C2D006FCA647EE8E5B6D97461739ECC569616488BFBBEE9D832DFBCC52879356CD676E9C254DEB257C366DF2E919327668DEA9FB5B8EF4F9E4CE54DC17C8B1B2160B4D214A7F9CBB380716EAC02730160B4B2A29D5801B215C09801A3356BFE6857BAB0366D7336567D7F2E9858F1FD6C656DDAE6E6664C673C6335E319A3CDCD9073C1E6BCA985D0218210C28868412B8C0BDE76BB1BDEB0410F0DEDEBECC44FB62BE6A9FA96F240932DB8D6F9AE35A5159D6855262486262F551DC62FC5DBD08E16D418D1EA56A44B1536A549EBF770575A01CFD4D1229280E7F23C5771C36B06EC402FAE88BF5D75696F4BD3C3107ED0620DE56A8C49398C33F63B9603261075A7AA7200A78CCABB6089FBEA4C88E792351EB1CABA327DDA9F6A361073E7B5F7EAC67D3CC0314DBD218AB2548EA82782FD4BD21F1093875D65634822E5A647B42FA9E70E7A70AE09259D2529D280BBEC53FD20B61987F57AA26BAAA22CEDA23BC580A61FB2229E8CE8BECA4BB8C89188DAC475ACBBFB13695777422FF14D7D87D23A608F6EBC53B7585477D14512F8CE21F983D8674AB7FF083BAA3782388AAE2FA5FAA4FC1DCD8F4B2F2ECA886EF7CCD14451D0AEEA5EA42AED22EFB9DB6CE8F5FAF51E11D1EFA9724FA72D1C14F93FACDF4F554FB4]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="Alt_G">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789CDD524B4F5361149CDEB6B42958FA4242E213A3D4D6073131AC6BE22F20AC910D21612BE117E0D204D94BD29890B0678531D4B864210B5204CB025A2DC162ADD0963E18E7DCFE0BDB7CE79EEF3CE6CC997B9F017805FB257340F9B3EB622B23FF05309E210F9E4686C94F4F00F2EDF8CE4B8BBC7B0D5804E865771E7F794F7E4865B600ABB1B8D5581CB0B8B20F3EEE92CF479385D9AC6191D93B6FF6CD260BAA71B3D3D396E965C5A86011726AC32C60BDE603531B765F4F99BF9E327F73CE7A66E6C985D6CC3CB0D0DA9C339CED4572A2B2BC44AE95979780B5F2F6223051C9AD5AE56CD6BA2657AC26B76A5D932B96058C9B599BD86363B3CC9A6FDCCC92C6C1ACD57810532C0A2F1CD439AC6787DF3806BFFE1E74D98F7DF6A1C6B06E7E553A7AB6D9609D7E657B7B5FB1CB3442B8E40F86DCAA8E22503EA8EC39BDE8C3105A8A75E8834F37BF70AC33283FE166CE18435CD39BC2F82D56C088E2D0B4018435B14AE312C185F04A6CB1C628FAC5FD2F23424CA0CA360F99C031EFE180F751D239E40D1439201EB784E7D3896B6659CC294EBBDC739987843E84806677153D6340FE23F18DE2174D133FFEA8E742B99B18949FE7B118A63186B474A98863405B3479A2CE126FE3A79EDFA54F83A348A9C32735E2D2A6A85979E1E4F9505A0DE29CD7B459497D47D2E14A2A9B5E70F5F3B84A87B45758FB5FD2D807B56F532C4CF38E9474C4B02DFFAB104EB4415C8CBCB215DDF6A45740486D29725DBC2B3C156B47188662D83171B63997BCAB13917E0DD9AEBE805361D5D45D55BD5F7A785435A29ABAAB81574C1CF70DDAFB7350382AF27F38FF00AB1C46DA]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="Alt_A">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789CED55FD4FD575147EEEE5BEF0AE2882A88862DA1515B48594828A99A0259BC34CD36458734EB7EA07C9EA87B6B6A8365B4BED65FA43225329356DA5E64D67801606B442C517F4AA2395EBCB1541E4CABDC0D3F3F9F257B475EF38F7F33D9FF3F29CE79CF3E52D0057603ECB6A007FAD754475BECE7381A9F9E4E5ACC1C9E4894C80FC6C6AD3F3C7D6D2FA5CCEDAB2816C9A72EA1B7257467EF53B818C488FAFD19F27B9B93CD655E5EFBAF286CE2BCAA35C5EFFB6B2D14EAF7F7E7D89341FD4AF8FF4FAEBCA07496FDFF4AAE4BE0BEBA49FE77B4FFAA2F0576E8FEFF560B5644B60BA34C18D79CE8901659970BC3962D30AD7DB77C8EC748F8FAC1CF3518B91E65C5262103E2DAF359503080BDD5E7FE3C699CE1CF9A6B98D6682FBFB7077DE0C787C33732179A02CC5F96EFBAE2BAB23C903E7564A8EFD74ADEBDC1D138D4C0CA44913732B57F25157BD22008607C0700218368AB77A5D3901A3D9B201306C00868D25CD2682CEC20C18B480416BA4C7B777A1B95DD26C3055872B841318B03735183D6022007B179AB3B11F388BF7D02621F929D7582E9F9523F977C1333663656CDA8A7A6C03713CBE9E99C027FF6C5BDE6627B7976E8F208FAD4D7590A7A4F7FA4BD79365A1C68D644E60733959E5FF222F4FFA9A1D465FBCD5E8D7542E56AEDAFD5592CD873B255B17BC6FF3F80A8BEC76AFFFB59A0C31F375519F3451F5C53A9794EE8CF0F8E2566648F6BCB9DFE1F13D515A15E1F5AFA92C1C4B1EAC58A4EE840EF74B761D6C94FCF8D43CF5FD78C53231B0A762BE7B696FCD8E3C7759E878599253713615BB3C3E677948E7CFB7BB659F76243AD2202F769485AEAD2B747C18B661946AB5210E0E44632EDCE853F50E697E600FFB18E0502C4421EEB39AB574CAB6571CCE4198767819053BFA19216B07BAE9D09D1B5DF24AD669286E315AF7D188C15DDE65BC7C86E312274A3F0257757F4F1E5D2CC4107DFF523C2042F963F1807ED90FC3500CD6FD540414F122C76381F2047948B77798842459DF643F431C8947CADBAD0C9178CC07ECE660A16A571DFD9C209F3067C0A5E8F57C2CAC31CA9BA27A9290AD3B4D0213A4015AD8C974A4631A6E0BD74D8E55FC748B1BBB4E01E539C341E86026DAF848F629BA6911AE1EE58BC6187864D7A6D39318013367A69A5E7628673513E1B3D024600E6A153DAC2836C5B65BD26430B2870F6539E03B12A9AAAA9FA61B36C5859E5C08B19791B24DB07C1F2AB713F1E2C9DC3B311E4DFC8D0D96C743F13C1105D226A09D2DF26B53F64762DECC7DAF3A14AF084176593DB589B76459A68923A09393C58F97F785F4590C42942C02E233411649B2BD24240E7163588B529C4E5579414C50310CA75D3ADBADEE0DC105C56FE3185C97262C4CC3C54E90BFF3B4B0A75A9953301DA6A676B16B43A27E3B7850D629582AEBDD6CD6D7F07456A89A98857342056459D36247A6F493C4F952DCE0757E2B06AFAAB3869D54E52E1007F1FAFD85A3D0CAD1CAECE71FF2CF14FE647D5F524F6261D86E1573BBC4F72D2E12867CF855433B1B35854D2C168EE7E4314CD55FE45931D3C41B8AB802B3300EBFB246B3918317AC19EB618CF809B28ED3F0A790B55ACF29CA93AD198F90C568213AA9B81E7115E2495E1343B97A6A54CC1A8E1317B3B58DC3B43375349DEBE671C51982F938CDCBC29FADCA9255DF0C6DCA10F579282A799E87A59F29E4E371461B131482138C53A74D779F52BC90EA19A51D99249EE2F0A33CDC5889C5626FB7F6660A966936489B6AB0C3CC5FBDCEFDDAB976ABEF7162C06C5A03C3DAF9C9AAC074FEB6760D56CF1A548FD3DA800EEEB7A662B2DE230333D24FB3EB8F3945FD3AAA796E60BE9ECE2BEA21BE288FD9CA79D59AF941DA8D3AF5275F735BA0E85DE26B3A76AAAF5F72BDAC5689DD7EE10EC9F69E7E1385CB747A9FAA356FA058ECB1E2F468BE81D5301504F98AF246CB6E97F93FA0272F5789B136CD4AA2B4D1C2FDB226738EAC0B70843F2BD202BDF18EF23B599837619FB5DFBED61BFCFFEFBFFBF72F289E2B4D]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Mesh Name="Alt_B">
+              <Producers>
+                <MeshImport>
+                  <MeshData>
+<![CDATA[789CD552BF4F5361143DEFBD9692D26A15A158457068A246D18DC4C99A383AB93875236193A1DD0D31CE841DC2A02134D1C5C5C1418CFF00893098548C145AD097D6AAD5D75FC773DF8B7F84DF97777BBF7BEF77CEB9F7EB1C8087B0F564FB43F7E85DE8E27541FE5DE056816CCE65B2E4CE0D807C7673E79E45564BE4C1F5F7EB40A548AD57570B6F81A8E665FECD6E7EB1522C77EF3FAA1407EDA585A8E6F6E52B55F2F9CCD38F66CDB76AB3E6FF5BC66E8C8071193E6038517CB50444BC11A37101860C18B259F3AF25224B2E2D3C8891F9C53B31D3430EDA6681E2C60B97AC2F3FF6361B7BA5436FDEDF5ADB76CBDD60E5A2FC3DF537EFD797C9CDC6D61A59EE16374C5DB062711767E0C195220F31FCE218E218C180BFB53DF4791ADFE9283B9467A72187B45A4F35D0D797ED30A9F3381CFC50D695D7664CD519DD8D23A1739FC7C2734216B34E88E5B3C5114C624A9C08E32EEA4274A5A4C98E7EA319A6D0622044C3E9B249AB4DA926DA2EACDED18D5342346E431B575F71E91BD0A7612614F3D5D12CCE624C2C29FC546E9F27ECE90E30A3DE67A53FE001DBCC0ACF0DF54C283EA578461AB24823274D1DED5EF8BE0D7EA5D54DE28497A4202725598C8AD714FDE16761591749C52E286773ECD3B49A9FC3218FB473D292C63EA791D42C46C3BA40E84DDD1DF09C90C89A26EB615AB99A3275458F851393BE096106D211FD07BF69A2D3EADEE7AE3A892B6BD1B47A76F0297C95B45EA4A759B5D4531AE7F5911619B22A6DD52FB5FFF2FB0B05771B4C]]>
+                  </MeshData>
+                </MeshImport>
+              </Producers>
+            </Mesh>
+            <Material Name="ActiveMaterial"/>
+            <Material Name="BlackKeyMaterial" Color="0.1569 0.1569 0.1569 1" Light="0" SpecularColor="0 0 0 1" Shininess="0.14"/>
+            <Material Name="WhiteKeyMaterial" SpecularColor="0 0 0 1"/>
+          </Definitions>
+          <OnUpdate>
+            <ZExpression>
+              <Expression>
+<![CDATA[currentColor = getColor(currentModel.lastChannel, currentModel.noteValue);
+ActiveMaterial.Color.R = currentColor[0];
+ActiveMaterial.Color.G = currentColor[1];
+ActiveMaterial.Color.B = currentColor[2];
+
+if (visible)
+{
+  if (isDown > 0)
+  {
+    sprayEmitter.ParticlesPerSecond = 10;
+
+    currentModel.particleColor[0] = currentColor[0];
+    currentModel.particleColor[1] = currentColor[1];
+    currentModel.particleColor[2] = currentColor[2];
+    currentModel.particleColor[3] = 0.5;
+
+    if (Parameters[P_LIGHT_KEYS] > 0.5)
+    {
+      materialType = 2;
+    }
+    else
+    {
+      materialType = isNoteBlack(NoteValue);
+    }
+
+  }
+  else
+  {
+    // Sloppy but works - should make a filter class.
+    // This filters the keys as they are released so
+    // it isn't as digital
+    // Need to add in multiplier off delta time.
+    int key = keyFromNote(CurrentModel.NoteValue);
+    if (key > -1)
+    {
+      // Have to do X now for arc
+      if (CurrentModel.Position.X - KeyPositions[key,0] < -KeyReturnStep)
+        CurrentModel.Position.X += KeyReturnStep;
+      else if (CurrentModel.Position.X - KeyPositions[key,0]> KeyReturnStep)
+        CurrentModel.Position.X -= KeyReturnStep;
+      else
+        CurrentModel.Position.X = KeyPositions[key,0];
+
+      if (CurrentModel.Position.Y - KeyPositions[key,1] < -KeyReturnStep)
+        CurrentModel.Position.Y += KeyReturnStep;
+      else if (CurrentModel.Position.Y - KeyPositions[key,1]> KeyReturnStep)
+        CurrentModel.Position.Y -= KeyReturnStep;
+      else
+        CurrentModel.Position.Y = KeyPositions[key,1];
+
+      if (CurrentModel.Position.Z - KeyPositions[key,2] < -KeyReturnStep)
+        CurrentModel.Position.Z += KeyReturnStep;
+      else if (CurrentModel.Position.Z - KeyPositions[key,2] > KeyReturnStep)
+        CurrentModel.Position.Z -= KeyReturnStep;
+      else
+        CurrentModel.Position.Z = KeyPositions[key,2];
+    }
+
+    // Particle color
+    if (currentModel.particleColor[0] > ColorReturnStep)
+      CurrentModel.particleColor[0] -= ColorReturnStep;
+    else
+      CurrentModel.particleColor[0] = 0;
+
+    if (currentModel.particleColor[1] > ColorReturnStep)
+      CurrentModel.particleColor[1] -= ColorReturnStep;
+    else
+      CurrentModel.particleColor[1] = 0;
+
+    if (currentModel.particleColor[2] > ColorReturnStep)
+      CurrentModel.particleColor[2] -= ColorReturnStep;
+    else
+      CurrentModel.particleColor[2] = 0;
+
+     sprayEmitter.ParticlesPerSecond = 0;
+    // Key material
+    materialType = isNoteBlack(NoteValue);
+    if (materialType == 1)
+    {
+      currentColor[0] = 0.1;
+      currentColor[1] = 0.1;
+      currentColor[2] = 0.1;
+    }
+    else
+    {
+      currentColor[0] = 0.9;
+      currentColor[1] = 0.9;
+      currentColor[2] = 0.9;
+    }
+  }
+}]]>
+              </Expression>
+            </ZExpression>
+          </OnUpdate>
+          <OnRender>
+            <Condition Name="If_Key_Is_Used" Expression="return (CurrentModel.visible == 1);">
+              <OnTrue>
+                <Condition Name="If_Show_Piano" Expression="return (Parameters[P_SHOW_PIANO] &gt; 0.5);">
+                  <OnTrue>
+                    <Condition Name="cond_is_it_active" Expression="return (CurrentModel.IsDown );">
+                      <OnTrue>
+                        <UseMaterial Material="ActiveMaterial"/>
+                      </OnTrue>
+                      <OnFalse>
+                        <Condition Name="cond_is_it_black" Expression="return (materialType == 1);">
+                          <OnTrue>
+                            <UseMaterial Material="BlackKeyMaterial"/>
+                          </OnTrue>
+                          <OnFalse>
+                            <UseMaterial Material="WhiteKeyMaterial"/>
+                          </OnFalse>
+                        </Condition>
+                      </OnFalse>
+                    </Condition>
+                    <ZExpression>
+                      <Expression>
+<![CDATA[int KeySet = floor(Parameters[P_KEY_SET]*1000);
+
+if (KeySet == 1)
+{
+  switch (NoteValue % 12)
+  {
+    case  0: RenderKey.Mesh = Alt_C; break;     // C
+    case  1: RenderKey.Mesh = Alt_Sharp; break; // C#
+    case  2: RenderKey.Mesh = Alt_D; break;
+    case  3: RenderKey.Mesh = Alt_Sharp; break;
+    case  4: RenderKey.Mesh = Alt_E; break;
+    case  5: RenderKey.Mesh = Alt_F; break;
+    case  6: RenderKey.Mesh = Alt_Sharp; break;
+    case  7: RenderKey.Mesh = Alt_G; break;
+    case  8: RenderKey.Mesh = Alt_Sharp; break;
+    case  9: RenderKey.Mesh = Alt_A; break;
+    case 10: RenderKey.Mesh = Alt_Sharp; break;
+    case 11: RenderKey.Mesh = Alt_B; break;
+  }
+}
+else
+{
+  switch (NoteValue % 12)
+  {
+    case  0: RenderKey.Mesh = KeyC_Origin; break;     // C
+    case  1: RenderKey.Mesh = KeySharp_Powder; break; // C#
+    case  2: RenderKey.Mesh = KeyD_Origin; break;
+    case  3: RenderKey.Mesh = KeySharp_Powder; break;
+    case  4: RenderKey.Mesh = KeyE_Origin; break;
+    case  5: RenderKey.Mesh = KeyF_Origin; break;
+    case  6: RenderKey.Mesh = KeySharp_Powder; break;
+    case  7: RenderKey.Mesh = KeyG_Origin; break;
+    case  8: RenderKey.Mesh = KeySharp_Powder; break;
+    case  9: RenderKey.Mesh = KeyA_Origin; break;
+    case 10: RenderKey.Mesh = KeySharp_Powder; break;
+    case 11: RenderKey.Mesh = KeyB_Origin; break;
+  }
+}]]>
+                      </Expression>
+                    </ZExpression>
+                    <RenderMesh Name="RenderKey"/>
+                  </OnTrue>
+                </Condition>
+                <Condition Name="If_Show_Particles" Expression="return (Parameters[P_SHOW_PARTICLES] &gt; 0.5);">
+                  <OnTrue>
+                    <UseMaterial Material="ActiveMaterial"/>
+                    <RenderParticles Name="sprayEmitter" ParticlesPerSecond="10" Spread="3.14" ParticleWidth="8" ParticleHeight="8" Speed="20" SpeedRange="10" ParticleLifetime="1" AnimateAlpha="-0.5" AnimateSize="-7" Damping="-1" Gravity="0 5 0">
+                      <OnEmitExpression>
+<![CDATA[float bright = 0;
+if (currentModel.isDown > 0)
+{
+  bright = random(0.5,0.5);
+}
+
+PColor.r = currentModel.particleColor[0] - bright;
+PColor.g = currentModel.particleColor[1] - bright;
+PColor.b = currentModel.particleColor[2] - bright;]]>
+                      </OnEmitExpression>
+                    </RenderParticles>
+                  </OnTrue>
+                </Condition>
+              </OnTrue>
+            </Condition>
+          </OnRender>
+        </Model>
+      </Children>
+    </Group> <!-- PianoData -->
+
+  </Content>
+</ZApplication>
